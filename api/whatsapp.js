@@ -26,47 +26,39 @@ Regras:
 
 export default async function handler(req, res) {
   console.log('=== WEBHOOK RECEBIDO ===')
-  console.log('Body completo:', JSON.stringify(req.body, null, 2))
+  console.log('Body:', JSON.stringify(req.body, null, 2))
 
   if (req.method === 'GET') {
     return res.status(200).json({ status: 'ok' })
   }
-  if (req.method !== 'POST') {
-    return res.status(405).end()
-  }
+  if (req.method !== 'POST') return res.status(405).end()
 
   try {
     const body = req.body || {}
 
-    // Log dos campos principais para debug
-    console.log('fromMe:', body.fromMe)
-    console.log('chatId:', body.chatId)
-    console.log('isGroup:', body.isGroup)
-    console.log('type:', body.type)
-
-    // Ignorar APENAS grupos — NÃO ignorar fromMe pois Z-API pode enviar diferente
-    const isGroup = (body.chatId || '').includes('@g.us') || body.isGroup === true
+    // Ignorar grupos (@g.us)
+    const chatId = body.chatId || ''
+    const isGroup = chatId.includes('@g.us') || body.isGroup === true
     if (isGroup) {
-      console.log('Ignorado: é grupo')
+      console.log('Ignorado: grupo')
       return res.status(200).json({ status: 'ignorado_grupo' })
     }
 
-    // Ignorar apenas se fromMe for explicitamente true E tiver messageId (mensagem enviada por mim)
-    // Mas NÃO ignorar notificações de status/conexão
+    // Ignorar mensagens enviadas por mim
     if (body.fromMe === true && body.messageId) {
-      console.log('Ignorado: mensagem enviada por mim')
+      console.log('Ignorado: fromMe')
       return res.status(200).json({ status: 'ignorado_fromMe' })
     }
 
-    // Extrair telefone — todos os formatos possíveis da Z-API
+    // Extrair telefone — suporta @c.us e @lid (formato novo do WhatsApp)
     const telefone =
       body.phone ||
-      body.sender?.replace('@c.us', '') ||
-      body.chatId?.replace('@c.us', '') ||
-      body.from?.replace('@c.us', '') ||
+      body.sender?.split('@')[0] ||
+      chatId.split('@')[0] ||  // funciona com @c.us e @lid
+      body.from?.split('@')[0] ||
       ''
 
-    // Extrair mensagem — todos os formatos possíveis da Z-API
+    // Extrair mensagem em todos os formatos Z-API
     const mensagem =
       body.text?.message ||
       body.message?.conversation ||
@@ -76,15 +68,16 @@ export default async function handler(req, res) {
       (typeof body.message === 'string' ? body.message : '') ||
       ''
 
-    console.log('Telefone extraído:', telefone)
-    console.log('Mensagem extraída:', mensagem)
+    console.log('Telefone:', telefone)
+    console.log('Mensagem:', mensagem)
+    console.log('ChatId:', chatId)
 
     if (!mensagem || !telefone) {
-      console.log('Sem mensagem ou telefone — ignorando')
-      return res.status(200).json({ status: 'sem_dados', telefone, mensagem })
+      console.log('Sem mensagem ou telefone')
+      return res.status(200).json({ status: 'sem_dados', telefone, mensagem, chatId })
     }
 
-    // Inicializar histórico
+    // Histórico de conversa
     if (!conversas[telefone]) {
       conversas[telefone] = { historico: [], leadSalvo: false }
     }
@@ -114,9 +107,9 @@ export default async function handler(req, res) {
     const iaData = await iaResponse.json()
     console.log('Anthropic status:', iaResponse.status)
     const resposta = iaData.content?.[0]?.text || 'Oi! Sou a Andréia da equipe do Lucas Labastie. Como posso te ajudar?'
-    console.log('Resposta da IA:', resposta.substring(0, 100))
+    console.log('Resposta IA (100 chars):', resposta.substring(0, 100))
 
-    // Verificar lead
+    // Verificar e salvar lead
     const matchLead = resposta.match(/DADOS_LEAD:(\{.*?\})/s)
     if (matchLead && !conversa.leadSalvo) {
       try {
@@ -141,13 +134,15 @@ export default async function handler(req, res) {
     const respostaLimpa = resposta.replace(/DADOS_LEAD:\{.*?\}/s, '').trim()
     conversa.historico.push({ role: 'assistant', content: resposta })
 
-    // Enviar via Z-API
-    console.log('Enviando resposta via Z-API para:', telefone)
+    // Enviar via Z-API — usar chatId original para garantir entrega
+    const destino = body.phone || chatId
+    console.log('Enviando para:', destino)
+
     const zapiUrl = `https://api.z-api.io/instances/${process.env.ZAPI_INSTANCE_ID}/token/${process.env.ZAPI_TOKEN}/send-text`
     const zapiResp = await fetch(zapiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phone: telefone, message: respostaLimpa })
+      body: JSON.stringify({ phone: destino, message: respostaLimpa })
     })
     const zapiData = await zapiResp.json()
     console.log('Z-API resposta:', JSON.stringify(zapiData))
