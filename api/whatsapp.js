@@ -32,6 +32,9 @@ export default async function handler(req, res) {
 
   try {
     const body = req.body || {}
+    const instanceId = process.env.ZAPI_INSTANCE_ID
+    const token = process.env.ZAPI_TOKEN
+    const baseUrl = `https://api.z-api.io/instances/${instanceId}/token/${token}`
 
     // Ignorar grupos
     const chatId = body.chatId || ''
@@ -46,7 +49,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ status: 'fromMe_ignorado' })
     }
 
-    // Extrair mensagem em todos os formatos Z-API
+    // Extrair mensagem
     const mensagem =
       body.text?.message ||
       body.message?.conversation ||
@@ -55,28 +58,30 @@ export default async function handler(req, res) {
       (typeof body.message === 'string' ? body.message : '') ||
       ''
 
-    // Extrair telefone — suporta @c.us, @lid e phone direto
+    // Extrair telefone: preferir phone, senão usar senderPhone, senão chatId
     const telefone =
       body.phone ||
+      body.senderPhone ||
       body.sender?.split('@')[0] ||
       chatId.split('@')[0] ||
       ''
 
-    console.log('Telefone:', telefone)
-    console.log('Mensagem:', mensagem)
+    console.log('chatId:', chatId)
+    console.log('telefone:', telefone)
+    console.log('mensagem:', mensagem)
 
     if (!mensagem || !telefone) {
       console.log('Sem dados — ignorando')
       return res.status(200).json({ status: 'sem_dados' })
     }
 
-    // Histórico de conversa por número
-    if (!conversas[telefone]) conversas[telefone] = { historico: [], leadSalvo: false }
+    // Histórico
+    if (!conversas[telefone]) conversas[telefone] = { historico: [], leadSalvo: false, telefoneReal: null }
     const conv = conversas[telefone]
     conv.historico.push({ role: 'user', content: mensagem })
     if (conv.historico.length > 20) conv.historico = conv.historico.slice(-20)
 
-    // ── Chamar a IA ─────────────────────────────────────────
+    // Chamar IA
     console.log('Chamando IA...')
     const iaRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -96,15 +101,15 @@ export default async function handler(req, res) {
     const iaData = await iaRes.json()
     console.log('IA status:', iaRes.status)
     const resposta = iaData.content?.[0]?.text || 'Oi! Sou a Andréia da equipe do Lucas Labastie. Como posso te ajudar?'
-    console.log('Resposta IA:', resposta.substring(0, 100))
+    console.log('Resposta IA:', resposta.substring(0, 150))
 
-    // ── Salvar lead se capturado ─────────────────────────────
+    // Salvar lead
     const leadMatch = resposta.match(/DADOS_LEAD:(\{.*?\})/s)
     if (leadMatch && !conv.leadSalvo) {
       try {
         const lead = JSON.parse(leadMatch[1])
         lead.telefone = lead.telefone || telefone
-        const r = await fetch(`${process.env.SUPABASE_URL}/functions/v1/captar-lead`, {
+        await fetch(`${process.env.SUPABASE_URL}/functions/v1/captar-lead`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -113,40 +118,61 @@ export default async function handler(req, res) {
           },
           body: JSON.stringify(lead)
         })
-        console.log('Lead salvo, status:', r.status)
+        console.log('Lead salvo:', lead)
         conv.leadSalvo = true
       } catch (e) {
-        console.error('Erro ao salvar lead:', e.message)
+        console.error('Erro lead:', e.message)
       }
     }
 
     const respostaFinal = resposta.replace(/DADOS_LEAD:\{.*?\}/s, '').trim()
     conv.historico.push({ role: 'assistant', content: resposta })
 
-    // ── Enviar via Z-API — SEM Client-Token (não habilitado) ─
-    const instanceId = process.env.ZAPI_INSTANCE_ID
-    const token = process.env.ZAPI_TOKEN
-    const zapiUrl = `https://api.z-api.io/instances/${instanceId}/token/${token}/send-text`
-    const destino = body.phone || chatId
+    // ── Enviar resposta ──────────────────────────────────────
+    // Tentar 3 formatos diferentes de destino
+    const tentativas = []
 
-    console.log('Enviando para Z-API, destino:', destino)
+    // 1. Se tiver phone direto
+    if (body.phone) tentativas.push(body.phone)
 
-    const zapiRes = await fetch(zapiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-        // Client-Token removido — token de segurança inativo na conta
-      },
-      body: JSON.stringify({
-        phone: destino,
-        message: respostaFinal
-      })
-    })
+    // 2. Número puro do chatId (funciona quando é @c.us)
+    if (chatId.includes('@c.us')) tentativas.push(chatId.split('@')[0])
 
-    const zapiData = await zapiRes.json()
-    console.log('Z-API status:', zapiRes.status, '| resposta:', JSON.stringify(zapiData))
+    // 3. chatId completo (funciona para alguns casos)
+    if (chatId) tentativas.push(chatId)
 
-    return res.status(200).json({ ok: true, zapiStatus: zapiRes.status })
+    // 4. Número puro sem @lid
+    if (chatId.includes('@lid')) tentativas.push(chatId.split('@')[0])
+
+    console.log('Tentativas de envio:', tentativas)
+
+    let enviado = false
+    for (const destino of tentativas) {
+      if (enviado) break
+      try {
+        console.log('Tentando enviar para:', destino)
+        const zapiRes = await fetch(`${baseUrl}/send-text`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone: destino, message: respostaFinal })
+        })
+        const zapiText = await zapiRes.text()
+        console.log(`Z-API [${destino}] status:`, zapiRes.status, '| body:', zapiText)
+
+        if (zapiRes.status === 200 || zapiRes.status === 201) {
+          enviado = true
+          console.log('✅ Enviado com sucesso para:', destino)
+        }
+      } catch (e) {
+        console.error('Erro tentativa', destino, ':', e.message)
+      }
+    }
+
+    if (!enviado) {
+      console.error('❌ Não foi possível enviar para nenhum destino')
+    }
+
+    return res.status(200).json({ ok: true, enviado })
 
   } catch (err) {
     console.error('ERRO GERAL:', err.message)
