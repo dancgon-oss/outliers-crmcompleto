@@ -39,13 +39,16 @@ export function AuthProvider({ children }) {
       isComercial:  role === 'comercial',
       isFinanceiro: role === 'financeiro',
       isOperacional:role === 'operacional',
+      isAluno:      role === 'aluno',
+      isStaff:      role === 'admin' || role === 'comercial' || role === 'financeiro' || role === 'operacional',
       // Helpers de acesso
       canSeeFinanceiro: role === 'admin' || role === 'comercial' || role === 'financeiro',
       canEditClientes:  role === 'admin' || role === 'comercial' || role === 'financeiro',
       canDeleteClientes:role === 'admin' || role === 'comercial',
       canManageEventos: role === 'admin' || role === 'comercial',
-      canCheckin:       true, // todos podem
-      canCadastrarParticipantes: true, // todos podem
+      canManageCursos:  role === 'admin' || role === 'comercial',
+      canCheckin:       role !== 'aluno',
+      canCadastrarParticipantes: role !== 'aluno',
       signIn:  function(e, p) { return supabase.auth.signInWithPassword({ email: e, password: p }) },
       signOut: function() { return supabase.auth.signOut() },
     }}>

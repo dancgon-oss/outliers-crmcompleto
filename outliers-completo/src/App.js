@@ -1,6 +1,7 @@
 import { AuthProvider, useAuth } from './lib/AuthContext'
 import LoginPage from './pages/LoginPage'
 import Shell from './pages/Shell'
+import PortalAluno from './pages/PortalAluno'
 
 function Root() {
   var auth = useAuth()
@@ -11,7 +12,9 @@ function Root() {
       </div>
     )
   }
-  return auth.user ? <Shell /> : <LoginPage />
+  if (!auth.user) return <LoginPage />
+  if (auth.isAluno) return <PortalAluno />
+  return <Shell />
 }
 
 export default function App() {

@@ -15,6 +15,8 @@ export default function EventosPage() {
   var [showQR, setShowQR] = useState(null)
   var [qrDataUrl, setQrDataUrl] = useState('')
   var [saving, setSaving] = useState(false)
+  var [sending, setSending] = useState(false)
+  var [sendResult, setSendResult] = useState(null)
   var [novoEvento, setNovoEvento] = useState({ nome: 'Paradigma', tipo: 'Paradigma', data_inicio: '', data_fim: '', local: '', descricao: '' })
   var [novoPart, setNovoPart] = useState({ nome: '', email: '', telefone: '', cpf: '' })
   var [search, setSearch] = useState('')
@@ -58,29 +60,88 @@ export default function EventosPage() {
   }
 
 
-  // Envia QR individual via WhatsApp
-  async function enviarQRWhatsApp(part) {
-    if (!part.telefone) { alert('Participante sem telefone cadastrado.'); return }
-    var url = window.location.origin + '/checkin/' + part.qr_token
-    var nomeEvento = selected ? selected.nome : 'Evento'
-    var dataEvento = selected ? fmtDate(selected.data_inicio) : ''
-    var msg = 'Ola ' + part.nome + '!\n\nSua vaga no *' + nomeEvento + '* (' + dataEvento + ') esta confirmada!\n\nSeu QR Code de check-in exclusivo:\n' + url + '\n\nApresente este link na entrada do evento para fazer seu check-in. Ate la!'
-    var tel = part.telefone.replace(/\D/g, '')
-    if (tel.length === 11) tel = '55' + tel
-    window.open('https://wa.me/' + tel + '?text=' + encodeURIComponent(msg), '_blank')
+  // Chama /api/enviar-qr (backend Z-API) para um batch de participantes.
+  // Trata erros de rede/auth e atualiza os participantes com qr_enviado_em.
+  async function callEnviarQrApi(ids) {
+    var sess = await supabase.auth.getSession()
+    var token = sess && sess.data && sess.data.session ? sess.data.session.access_token : ''
+    if (!token) { alert('Sessão expirada. Faça login novamente.'); return null }
+    try {
+      var res = await fetch('/api/enviar-qr', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+        body: JSON.stringify({ participante_ids: ids }),
+      })
+      var data = await res.json().catch(function(){ return {} })
+      if (!res.ok) throw new Error(data.error || data.detail || ('HTTP ' + res.status))
+      return data
+    } catch (e) {
+      return { ok: false, enviados: 0, erros: ids.length, erroGeral: e.message || 'Falha na requisição', results: [] }
+    }
   }
 
-  // Envia QR para TODOS
-  async function enviarParaTodos() {
-    if (!participantes.length) { alert('Nenhum participante cadastrado.'); return }
-    var comTelefone = participantes.filter(function(p){ return p.telefone })
-    if (!comTelefone.length) { alert('Nenhum participante com telefone cadastrado.'); return }
-    var confirmar = window.confirm('Enviar QR Code pelo WhatsApp para ' + comTelefone.length + ' participante(s)?')
-    if (!confirmar) return
-    for (var i = 0; i < comTelefone.length; i++) {
-      enviarQRWhatsApp(comTelefone[i])
-      await new Promise(function(r){ setTimeout(r, 1000) })
+  // Envia QR individual via Z-API (automatizado, sem browser redirect)
+  async function enviarQRWhatsApp(part) {
+    if (!part || !part.telefone) { alert('Participante sem telefone cadastrado.'); return }
+    if (sending) return
+    setSending(true); setSendResult(null)
+    var resp = await callEnviarQrApi([part.id])
+    setSending(false)
+    if (!resp) return
+    if (resp.erroGeral) { alert('Erro: ' + resp.erroGeral); return }
+    var r0 = resp.results && resp.results[0]
+    if (r0 && r0.ok) {
+      setSendResult({ type: 'success', msg: 'QR enviado para ' + part.nome + ' via WhatsApp.' })
+      if (selected) fetchParticipantes(selected.id)
+    } else {
+      setSendResult({ type: 'error', msg: 'Falha ao enviar para ' + part.nome + ': ' + (r0 && r0.erro || 'desconhecido') })
     }
+  }
+
+  // Envia QR em lote (sequencial, 1 por vez — Bravos é síncrono com delay anti-ban).
+  // O tempo total é ~8-15s por mensagem × N participantes. Browser deve ficar aberto.
+  async function enviarParaTodos(alvo) {
+    var base = alvo && alvo.length ? alvo : participantes
+    if (!base.length) { alert('Nenhum participante.'); return }
+    var comTelefone = base.filter(function(p){ return p.telefone })
+    var semTelefone = base.length - comTelefone.length
+    if (!comTelefone.length) { alert('Nenhum participante com telefone.'); return }
+    var tempoEstimado = Math.round(comTelefone.length * 12 / 60) // ~12s por msg, em minutos
+    var confirmar = window.confirm(
+      'Enviar QR Code via WhatsApp para ' + comTelefone.length + ' participante(s)?'
+      + '\n\nTempo estimado: ~' + tempoEstimado + ' min (Bravos espaça os envios pra evitar ban).'
+      + '\nA aba precisa ficar aberta até o fim.'
+      + (semTelefone ? '\n\n' + semTelefone + ' serão ignorados (sem telefone).' : '')
+    )
+    if (!confirmar) return
+
+    setSending(true); setSendResult({ type: 'progress', msg: 'Iniciando envio...', totalOk: 0, totalPend: 0, totalErr: 0, total: comTelefone.length, atual: 0 })
+
+    var totalOk = 0, totalPend = 0, totalErr = 0, detalhes = []
+    for (var i = 0; i < comTelefone.length; i++) {
+      var p = comTelefone[i]
+      setSendResult({
+        type: 'progress',
+        msg: 'Enviando ' + (i+1) + '/' + comTelefone.length + ' — ' + (p.nome || ''),
+        totalOk: totalOk, totalPend: totalPend, totalErr: totalErr, total: comTelefone.length, atual: i+1,
+      })
+      var resp = await callEnviarQrApi([p.id])
+      var r0 = resp && resp.results && resp.results[0]
+      if (r0 && r0.ok) totalOk++
+      else if (r0 && r0.pendente) { totalPend++; detalhes.push(r0) }
+      else if (r0) { totalErr++; detalhes.push(r0) }
+      else if (resp && resp.erroGeral) { totalErr++; detalhes.push({ id: p.id, nome: p.nome, erro: resp.erroGeral }) }
+    }
+    setSending(false)
+    setSendResult({
+      type: totalErr === 0 ? (totalPend === 0 ? 'success' : 'partial') : (totalOk === 0 && totalPend === 0 ? 'error' : 'partial'),
+      msg: 'Concluído · ✓ ' + totalOk + ' enviados'
+        + (totalPend ? ' · ⏳ ' + totalPend + ' pendentes (aguardando confirmação Bravos)' : '')
+        + (totalErr ? ' · ✕ ' + totalErr + ' erros' : '')
+        + (semTelefone ? ' · ' + semTelefone + ' sem telefone' : ''),
+      detalhes: detalhes,
+    })
+    if (selected) fetchParticipantes(selected.id)
   }
 
   var filtrados = participantes.filter(function(p) {
@@ -176,8 +237,8 @@ export default function EventosPage() {
 
           {/* Participantes */}
           <div style={{ padding: '16px 22px', flex: 1, overflowY: 'auto' }}>
-            <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
-              <input style={{ ...S.inp, flex: 1 }} placeholder="Buscar participante..." value={search} onChange={function(e){setSearch(e.target.value)}} />
+            <div style={{ display: 'flex', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+              <input style={{ ...S.inp, flex: 1, minWidth: 180 }} placeholder="Buscar participante..." value={search} onChange={function(e){setSearch(e.target.value)}} />
               <button style={S.btnG} onClick={function(){setShowNovoPart(true)}}>+ Participante</button>
               <label style={{ ...S.btnGhost, padding: '9px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
                 📂 CSV
@@ -192,16 +253,67 @@ export default function EventosPage() {
                   if (rows.length) { await supabase.from('participantes').insert(rows); await fetchParticipantes(selected.id) }
                 }} />
               </label>
+              <button
+                style={{ ...S.btnGhost, padding: '9px 14px', opacity: sending ? 0.6 : 1, cursor: sending ? 'wait' : 'pointer' }}
+                disabled={sending}
+                onClick={function(){ enviarParaTodos(participantes.filter(function(p){ return !p.qr_enviado_em })) }}
+                title="Envia QR por WhatsApp para quem ainda não recebeu"
+              >📱 Enviar QR (pendentes)</button>
+              <button
+                style={{ ...S.btnGhost, padding: '9px 14px', opacity: sending ? 0.6 : 1, cursor: sending ? 'wait' : 'pointer' }}
+                disabled={sending}
+                onClick={function(){ enviarParaTodos(participantes) }}
+                title="Reenvia para todos os participantes com telefone"
+              >📱 Enviar QR (todos)</button>
             </div>
 
+            {sending && sendResult && sendResult.type === 'progress' && (
+              <div style={{ marginBottom: 12, padding: '12px 16px', borderRadius: 8, background: C.bgCard, border: '1px solid ' + C.border2 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, color: C.gold, marginBottom: 8 }}>
+                  <span>{sendResult.msg}</span>
+                  <span style={{ fontFamily: 'monospace', color: C.text2 }}>{sendResult.atual}/{sendResult.total}</span>
+                </div>
+                <div style={{ height: 4, background: C.border, borderRadius: 2, overflow: 'hidden' }}>
+                  <div style={{
+                    height: '100%',
+                    width: (sendResult.total ? Math.round(sendResult.atual / sendResult.total * 100) : 0) + '%',
+                    background: 'linear-gradient(90deg,#c9a96e,#a07840)',
+                    transition: 'width .25s',
+                  }} />
+                </div>
+                <div style={{ display: 'flex', gap: 14, marginTop: 8, fontSize: 11, color: C.text3 }}>
+                  <span>✓ Enviados: <b style={{ color: '#4ade80' }}>{sendResult.totalOk}</b></span>
+                  {!!sendResult.totalPend && <span>⏳ Pendentes: <b style={{ color: C.yellow }}>{sendResult.totalPend}</b></span>}
+                  <span>✕ Erros: <b style={{ color: '#fca5a5' }}>{sendResult.totalErr}</b></span>
+                </div>
+              </div>
+            )}
+            {sending && (!sendResult || sendResult.type !== 'progress') && (
+              <div style={{ marginBottom: 12, padding: '10px 14px', borderRadius: 8, background: C.bgCard, border: '1px solid ' + C.border2, fontSize: 13, color: C.gold }}>
+                Enviando QR Code via WhatsApp...
+              </div>
+            )}
+            {sendResult && !sending && sendResult.type !== 'progress' && (
+              <div style={{
+                marginBottom: 12, padding: '10px 14px', borderRadius: 8, fontSize: 13,
+                background: sendResult.type === 'success' ? '#14532d22' : (sendResult.type === 'partial' ? '#78350f22' : '#7f1d1d22'),
+                border: '1px solid ' + (sendResult.type === 'success' ? '#14532d' : (sendResult.type === 'partial' ? '#78350f' : '#7f1d1d')),
+                color: sendResult.type === 'success' ? '#4ade80' : (sendResult.type === 'partial' ? C.yellow : '#fca5a5'),
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
+              }}>
+                <span>{sendResult.msg}</span>
+                <button style={{ background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', fontSize: 13 }} onClick={function(){ setSendResult(null) }}>✕</button>
+              </div>
+            )}
+
             <div style={S.card}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 130px 110px 80px 80px 90px', padding: '10px 16px', borderBottom: '1px solid ' + C.border }}>
-                {['Nome','Telefone','Check-in','Comprou','Contrato','QR'].map(function(h,i){ return <span key={i} style={{ fontSize: 10, fontWeight: 600, color: C.text3, textTransform: 'uppercase', letterSpacing: '0.08em' }}>{h}</span> })}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 130px 110px 100px 70px 70px 90px', padding: '10px 16px', borderBottom: '1px solid ' + C.border }}>
+                {['Nome','Telefone','Check-in','QR WhatsApp','Comprou','Contrato','Ações'].map(function(h,i){ return <span key={i} style={{ fontSize: 10, fontWeight: 600, color: C.text3, textTransform: 'uppercase', letterSpacing: '0.08em' }}>{h}</span> })}
               </div>
               {filtrados.length === 0 && <div style={{ padding: 30, textAlign: 'center', color: C.text3, fontSize: 13, fontStyle: 'italic' }}>Nenhum participante.</div>}
               {filtrados.map(function(p, i, arr) {
                 return (
-                  <div key={p.id} style={{ display: 'grid', gridTemplateColumns: '1fr 130px 110px 80px 80px 90px', padding: '11px 16px', borderBottom: i < arr.length-1 ? '1px solid ' + C.border : 'none', alignItems: 'center' }}>
+                  <div key={p.id} style={{ display: 'grid', gridTemplateColumns: '1fr 130px 110px 100px 70px 70px 90px', padding: '11px 16px', borderBottom: i < arr.length-1 ? '1px solid ' + C.border : 'none', alignItems: 'center', gap: 6 }}>
                     <div>
                       <div style={{ fontSize: 14, fontWeight: 500, color: C.text }}>{p.nome}</div>
                       {p.email && <div style={{ fontSize: 11, color: C.text3 }}>{p.email}</div>}
@@ -211,6 +323,11 @@ export default function EventosPage() {
                       {p.checkin_at
                         ? <span style={{ color: '#4ade80', fontWeight: 600 }}>✓ {new Date(p.checkin_at).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}</span>
                         : <span style={{ color: C.text3 }}>Pendente</span>}
+                    </div>
+                    <div style={{ fontSize: 11 }}>
+                      {p.qr_enviado_em
+                        ? <span title={new Date(p.qr_enviado_em).toLocaleString('pt-BR')} style={{ color: '#4ade80', fontWeight: 600 }}>✓ Enviado</span>
+                        : <span style={{ color: C.text3 }}>—</span>}
                     </div>
                     <div style={{ fontSize: 11 }}>{p.comprou ? <span style={{ color: C.gold, fontWeight: 600 }}>Sim</span> : <span style={{ color: C.text3 }}>—</span>}</div>
                     <div style={{ fontSize: 11 }}>{p.comprou ? <span style={{ color: '#4ade80' }}>✓</span> : <span style={{ color: C.text3 }}>—</span>}</div>
@@ -276,7 +393,11 @@ export default function EventosPage() {
             <div style={{ display:'flex', gap:10, justifyContent:'center' }}>
               <button style={S.btnGhost} onClick={function(){setShowQR(null)}}>Fechar</button>
               <button style={S.btnG} onClick={function(){ var a=document.createElement('a'); a.download='qr-'+showQR.nome.replace(/\s+/g,'-')+'.png'; a.href=qrDataUrl; a.click() }}>⬇ Baixar</button>
-              <button onClick={function(){ enviarQRWhatsApp(showQR) }} style={{ background:'#14532d',border:'1px solid #16a34a',color:'#4ade80',padding:'9px 16px',borderRadius:8,fontFamily:'Inter,sans-serif',fontSize:13,fontWeight:600,cursor:'pointer' }}>📱 WhatsApp</button>
+              <button
+                disabled={sending}
+                onClick={function(){ enviarQRWhatsApp(showQR) }}
+                style={{ background:'#14532d',border:'1px solid #16a34a',color:'#4ade80',padding:'9px 16px',borderRadius:8,fontFamily:'Inter,sans-serif',fontSize:13,fontWeight:600,cursor: sending ? 'wait' : 'pointer', opacity: sending ? 0.6 : 1 }}
+              >📱 {sending ? 'Enviando...' : (showQR.qr_enviado_em ? 'Reenviar' : 'WhatsApp')}</button>
             </div>
           </div>
         </div>

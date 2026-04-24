@@ -1,6 +1,9 @@
 // ─────────────────────────────────────────────────────────────
 //  Outliers CRM · Edge Function: captar-lead
-//  Recebe os dados do agente de IA e salva na tabela `clientes`
+//  Captura de leads de múltiplas fontes:
+//   - Agente IA (WhatsApp via /api/whatsapp)
+//   - Landings públicas (/outliers, /paradigma, /pqv, ...)
+//  Schema: respeita CHECK constraints atuais de `origem` e `status`.
 // ─────────────────────────────────────────────────────────────
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
@@ -11,18 +14,46 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
-serve(async (req: Request) => {
+// Valores aceitos pelo CHECK constraint atual em `clientes.origem`.
+// Landings diferentes de Paradigma caem em 'Outro' até rodarmos migration.
+const ORIGEM_VALIDA = new Set(['Paradigma', 'Indicação', 'Renovação', 'Outro'])
 
-  // Responde ao preflight do CORS (obrigatório para chamadas do navegador)
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders })
-  }
+function normOrigem(o?: string) {
+  if (!o) return 'Outro'
+  return ORIGEM_VALIDA.has(o) ? o : 'Outro'
+}
+
+function sanitizeTel(t?: string) {
+  if (!t) return ''
+  return String(t).replace(/\D/g, '')
+}
+
+function sanitizeCpf(c?: string) {
+  if (!c) return null
+  const only = String(c).replace(/\D/g, '')
+  return only.length === 11 ? only : null
+}
+
+serve(async (req: Request) => {
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
-    // ── 1. Lê os dados enviados pelo agente ──────────────────
-    const { nome, email, telefone, treinamento } = await req.json()
+    const body = await req.json()
+    const {
+      nome,
+      email,
+      telefone,
+      cpf,
+      treinamento,    // compat com agente IA (legado)
+      programa,       // novo: 'Outliers' | 'Paradigma' | 'PQV' | 'Método Cash' | 'Cursos Online' | ...
+      origem,         // novo: 'Paradigma' | 'Indicação' | 'Renovação' | 'Outro'
+      landing_slug,   // novo: identifica qual landing gerou o lead (ex: 'outliers', 'pqv')
+      utm_source,
+      utm_medium,
+      utm_campaign,
+      observacoes_extras,
+    } = body || {}
 
-    // Validação mínima
     if (!nome || !email || !telefone) {
       return new Response(
         JSON.stringify({ error: 'Campos obrigatórios: nome, email, telefone' }),
@@ -30,46 +61,57 @@ serve(async (req: Request) => {
       )
     }
 
-    // ── 2. Conecta ao Supabase com a service_role key ────────
-    //    (usa variáveis de ambiente configuradas no Supabase Dashboard)
     const supabase = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     )
 
-    // ── 3. Verifica se o lead já existe pelo e-mail ──────────
+    const emailNorm = String(email).toLowerCase().trim()
+    const telNorm = sanitizeTel(telefone)
+    const cpfNorm = sanitizeCpf(cpf)
+
+    // Dedup por e-mail
     const { data: existing } = await supabase
       .from('clientes')
-      .select('id, nome, email')
-      .eq('email', email.toLowerCase().trim())
+      .select('id')
+      .eq('email', emailNorm)
       .maybeSingle()
 
     if (existing) {
-      // Lead já cadastrado — retorna sucesso sem duplicar
       return new Response(
-        JSON.stringify({
-          success: true,
-          message: 'Lead já existente',
-          id: existing.id,
-          duplicado: true
-        }),
+        JSON.stringify({ success: true, message: 'Lead já existente', id: existing.id, duplicado: true }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
-    // ── 4. Insere o novo lead na tabela clientes ─────────────
+    // Monta observações com todo o rastro para não perder informação
+    const rastro: string[] = []
+    rastro.push(`Captado em ${new Date().toLocaleDateString('pt-BR')}`)
+    if (landing_slug) rastro.push(`landing=${landing_slug}`)
+    if (utm_source) rastro.push(`utm_source=${utm_source}`)
+    if (utm_medium) rastro.push(`utm_medium=${utm_medium}`)
+    if (utm_campaign) rastro.push(`utm_campaign=${utm_campaign}`)
+    if (observacoes_extras) rastro.push(String(observacoes_extras))
+
+    const programaFinal = programa || treinamento || 'Outliers'
+    const origemFinal = normOrigem(origem || (landing_slug ? 'Outro' : 'Paradigma'))
+
+    const insertPayload: Record<string, unknown> = {
+      nome: String(nome).trim(),
+      email: emailNorm,
+      telefone: telNorm,
+      origem: origemFinal,
+      status: 'Ativo',
+      stage: 'Novo',                 // entra direto no kanban comercial
+      programa: programaFinal,
+      observacoes: rastro.join(' | '),
+      data_entrada: new Date().toISOString().split('T')[0],
+    }
+    if (cpfNorm) insertPayload.cpf = cpfNorm
+
     const { data, error } = await supabase
       .from('clientes')
-      .insert({
-        nome:          nome.trim(),
-        email:         email.toLowerCase().trim(),
-        telefone:      telefone.trim(),
-        origem:        'Paradigma',           // sempre Imersão Paradigma
-        status:        'Ativo',
-        programa:      treinamento || 'Imersão Paradigma',
-        observacoes:   `Lead captado automaticamente pelo Agente IA (${new Date().toLocaleDateString('pt-BR')})`,
-        data_entrada:  new Date().toISOString().split('T')[0],
-      })
+      .insert(insertPayload)
       .select('id')
       .single()
 
@@ -81,20 +123,15 @@ serve(async (req: Request) => {
       )
     }
 
-    // ── 5. Retorna sucesso ───────────────────────────────────
     return new Response(
-      JSON.stringify({
-        success: true,
-        message: 'Lead salvo com sucesso!',
-        id: data.id
-      }),
+      JSON.stringify({ success: true, message: 'Lead salvo com sucesso!', id: data.id }),
       { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     )
 
-  } catch (err) {
+  } catch (err: any) {
     console.error('Erro inesperado:', err)
     return new Response(
-      JSON.stringify({ error: 'Erro interno' }),
+      JSON.stringify({ error: 'Erro interno', detail: err?.message }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     )
   }

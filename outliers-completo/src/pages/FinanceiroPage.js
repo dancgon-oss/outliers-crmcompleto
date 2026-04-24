@@ -26,6 +26,8 @@ export default function FinanceiroPage() {
   var [cobrancaLoading, setCobrancaLoading] = useState(false)
   var [cobrancaErr, setCobrancaErr] = useState('')
   var [stats, setStats] = useState({ recebido: 0, pendente: 0, atrasado: 0, totalClientes: 0 })
+  var [massLoading, setMassLoading] = useState(false)
+  var [massProgress, setMassProgress] = useState(null) // { atual, total, ok, err, msg }
 
   useEffect(function() { carregar() }, [])
 
@@ -95,6 +97,78 @@ export default function FinanceiroPage() {
       setFinanceiro(fin || null)
     } catch(e) { setCobrancaErr(e.message || 'Erro ao emitir cobranca') }
     setCobrancaLoading(false)
+  }
+
+  // Emite cobranças no Asaas pra TODAS as parcelas pendentes que ainda não têm
+  // asaas_payment_id. Usa o `cobrancaBilling` atual. Serial pra respeitar rate limit Asaas.
+  async function emitirEmMassa() {
+    if (!selected || !financeiro) return
+    var pendentes = (financeiro.parcelas || []).filter(function(p) {
+      return p.status !== 'Pago' && !p.asaas_payment_id
+    })
+    if (!pendentes.length) { alert('Nenhuma parcela pendente para emitir.'); return }
+    pendentes.sort(function(a, b){ return (a.numero || 0) - (b.numero || 0) })
+
+    var labelBilling = cobrancaBilling === 'UNDEFINED' ? 'Cliente escolhe' : cobrancaBilling
+    var confirmar = window.confirm(
+      'Emitir ' + pendentes.length + ' cobrança(s) no Asaas como ' + labelBilling + '?'
+      + '\n\nO cliente será sincronizado no Asaas se ainda não estiver.'
+    )
+    if (!confirmar) return
+
+    setMassLoading(true)
+    setMassProgress({ atual: 0, total: pendentes.length, ok: 0, err: 0, msg: 'Sincronizando cliente...' })
+
+    try {
+      // Sync uma vez só
+      var asaasId = await syncClienteAsaas(selected)
+      if (!selected.asaas_customer_id && asaasId) {
+        await supabase.from('clientes').update({ asaas_customer_id: asaasId }).eq('id', selected.id)
+      }
+
+      var ok = 0, err = 0
+      for (var i = 0; i < pendentes.length; i++) {
+        var p = pendentes[i]
+        setMassProgress({ atual: i + 1, total: pendentes.length, ok: ok, err: err, msg: 'Emitindo parcela ' + p.numero + '/' + pendentes.length })
+        try {
+          var cob = await criarCobranca({
+            asaasCustomerId: asaasId,
+            valor: p.valor,
+            vencimento: p.vencimento || new Date().toISOString().split('T')[0],
+            descricao: 'Outliers · Parcela ' + p.numero,
+            billingType: cobrancaBilling,
+            parcelaId: p.id,
+          })
+          var pix = null
+          if ((cobrancaBilling === 'PIX' || cobrancaBilling === 'UNDEFINED') && cob.id) {
+            try { pix = await buscarPixQrCode(cob.id) } catch (_e) {}
+          }
+          await supabase.from('parcelas').update({
+            asaas_payment_id: cob.id,
+            asaas_status: cob.status,
+            asaas_invoice_url: cob.invoiceUrl,
+            asaas_boleto_url: cob.bankSlipUrl,
+            asaas_pix_copia_cola: pix ? pix.payload : null,
+          }).eq('id', p.id)
+          ok++
+        } catch (e) {
+          console.error('emitir parcela', p.numero, e)
+          err++
+        }
+      }
+
+      setMassProgress({ atual: pendentes.length, total: pendentes.length, ok: ok, err: err, msg: 'Concluído' })
+
+      // Atualiza dados
+      var { data: fin } = await supabase.from('financeiro').select('*, parcelas(*)').eq('cliente_id', selected.id).maybeSingle()
+      setFinanceiro(fin || null)
+      await carregar()
+    } catch (e) {
+      setMassProgress(function(prev){ return { ...(prev || {}), msg: 'Erro: ' + (e.message || 'falha ao sincronizar cliente') } })
+    }
+    setMassLoading(false)
+
+    setTimeout(function(){ setMassProgress(null) }, 5000)
   }
 
   var filtrados = clientes.filter(function(c) {
@@ -248,10 +322,53 @@ export default function FinanceiroPage() {
 
                 {/* Parcelas */}
                 <div style={S.card}>
-                  <div style={{ padding:'12px 18px',borderBottom:'1px solid #2a2415',display:'flex',justifyContent:'space-between',alignItems:'center' }}>
+                  <div style={{ padding:'12px 18px',borderBottom:'1px solid #2a2415',display:'flex',justifyContent:'space-between',alignItems:'center',gap:10,flexWrap:'wrap' }}>
                     <span style={{ fontSize:13,fontWeight:600,color:'#f0ead8' }}>Parcelas</span>
-                    <span style={{ fontSize:11,color:'#7a6a4a' }}>{(financeiro.parcelas||[]).filter(function(p){return p.status==='Pago'}).length}/{(financeiro.parcelas||[]).length} pagas</span>
+                    <div style={{ display:'flex',gap:10,alignItems:'center' }}>
+                      <span style={{ fontSize:11,color:'#7a6a4a' }}>{(financeiro.parcelas||[]).filter(function(p){return p.status==='Pago'}).length}/{(financeiro.parcelas||[]).length} pagas</span>
+                      {(function(){
+                        var semCobranca = (financeiro.parcelas||[]).filter(function(p){ return p.status !== 'Pago' && !p.asaas_payment_id }).length
+                        if (!semCobranca) return null
+                        return (
+                          <div style={{ display:'flex',gap:8,alignItems:'center' }}>
+                            <select value={cobrancaBilling} onChange={function(e){setCobrancaBilling(e.target.value)}}
+                              style={{ ...S.inp,width:130,padding:'6px 10px',fontSize:12 }}>
+                              <option value="UNDEFINED">Cliente escolhe</option>
+                              <option value="PIX">PIX</option>
+                              <option value="BOLETO">Boleto</option>
+                              <option value="CREDIT_CARD">Cartão</option>
+                            </select>
+                            <button
+                              style={{ ...S.btnG, padding:'6px 12px', fontSize:12, opacity: massLoading ? 0.6 : 1, cursor: massLoading ? 'wait' : 'pointer' }}
+                              onClick={emitirEmMassa}
+                              disabled={massLoading}
+                            >{massLoading ? 'Emitindo...' : '+ Emitir ' + semCobranca + ' pendente' + (semCobranca > 1 ? 's' : '')}</button>
+                          </div>
+                        )
+                      })()}
+                    </div>
                   </div>
+
+                  {massProgress && (
+                    <div style={{ padding:'10px 18px',borderBottom:'1px solid #2a2415',background:'#0d0b06' }}>
+                      <div style={{ display:'flex',justifyContent:'space-between',fontSize:12,color:'#c9a96e',marginBottom:6 }}>
+                        <span>{massProgress.msg}</span>
+                        <span style={{ fontFamily:'monospace',color:'#b8a882' }}>{massProgress.atual}/{massProgress.total}</span>
+                      </div>
+                      <div style={{ height:4,background:'#2a2415',borderRadius:2,overflow:'hidden' }}>
+                        <div style={{
+                          height:'100%',
+                          width: (massProgress.total ? Math.round(massProgress.atual / massProgress.total * 100) : 0) + '%',
+                          background:'linear-gradient(90deg,#c9a96e,#a07840)',
+                          transition:'width .25s',
+                        }} />
+                      </div>
+                      <div style={{ display:'flex',gap:14,marginTop:6,fontSize:11,color:'#7a6a4a' }}>
+                        <span>✓ <b style={{ color:'#4ade80' }}>{massProgress.ok}</b></span>
+                        <span>✕ <b style={{ color:'#fca5a5' }}>{massProgress.err}</b></span>
+                      </div>
+                    </div>
+                  )}
 
                   {(financeiro.parcelas||[]).map(function(p,i,arr) {
                     var pc = PARC_C[p.status] || PARC_C['Pendente']

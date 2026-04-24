@@ -24,11 +24,40 @@ var SignaturePad = forwardRef(function(props, ref) {
   return <canvas ref={canvasRef} width={500} height={130} style={{ border:'1px solid #2a2415',background:'#1c1810',cursor:'crosshair',touchAction:'none',display:'block',width:'100%',height:130,borderRadius:8 }} onMouseDown={start} onMouseMove={draw} onMouseUp={stop} onMouseLeave={stop} onTouchStart={start} onTouchMove={draw} onTouchEnd={stop} />
 })
 
+// ── Helpers pra check-in multi-dia ─────────────────────────────
+function hojeISO() { return new Date().toISOString().slice(0, 10) }
+
+// Define o "dia alvo" do check-in baseado na data atual + range do evento.
+// Se o operador está fazendo check-in antes do evento começar, grava no primeiro dia.
+// Se o evento já encerrou, grava no último dia. No meio, grava no dia atual.
+function resolveDiaAlvo(evento) {
+  var hoje = hojeISO()
+  var inicio = evento && evento.data_inicio ? evento.data_inicio : hoje
+  var fim = evento && evento.data_fim ? evento.data_fim : inicio
+  if (hoje < inicio) return inicio
+  if (hoje > fim) return fim
+  return hoje
+}
+
+function listaDiasEvento(evento) {
+  if (!evento || !evento.data_inicio) return []
+  var dias = [evento.data_inicio]
+  if (!evento.data_fim || evento.data_fim === evento.data_inicio) return dias
+  var d = new Date(evento.data_inicio + 'T00:00:00')
+  var end = new Date(evento.data_fim + 'T00:00:00')
+  while (d < end) {
+    d.setDate(d.getDate() + 1)
+    dias.push(d.toISOString().slice(0, 10))
+  }
+  return dias
+}
+
 export default function CheckinPage() {
   var auth = useAuth()
   var [mode, setMode] = useState('scan')
   var [participante, setParticipante] = useState(null)
   var [evento, setEvento] = useState(null)
+  var [checkinInfo, setCheckinInfo] = useState(null) // { dia, jaTinha, historico: [{dia, checkin_at}] }
   var [manualSearch, setManualSearch] = useState('')
   var [error, setError] = useState('')
   var [saving, setSaving] = useState(false)
@@ -78,6 +107,43 @@ export default function CheckinPage() {
     animRef.current = requestAnimationFrame(scanFrame)
   }, [])
 
+  // Registra check-in no dia alvo. Idempotente: se já existe, marca jaTinha=true e não duplica.
+  // Mantém participantes.checkin_at (legado) populado com o 1º check-in.
+  async function registrarCheckin(part, evt) {
+    var userId = auth.profile ? auth.profile.id : null
+    var dia = resolveDiaAlvo(evt)
+    var agora = new Date().toISOString()
+
+    var existing = await supabase.from('checkin_dias')
+      .select('id, checkin_at')
+      .eq('participante_id', part.id)
+      .eq('dia', dia)
+      .maybeSingle()
+
+    var jaTinha = !!(existing && existing.data)
+
+    if (!jaTinha) {
+      await supabase.from('checkin_dias').insert({
+        participante_id: part.id, dia: dia, checkin_at: agora, checkin_por: userId,
+      })
+    }
+
+    // Mantém compat: preenche participantes.checkin_at se ainda não há nada
+    if (!part.checkin_at) {
+      await supabase.from('participantes')
+        .update({ checkin_at: agora, checkin_por: userId })
+        .eq('id', part.id)
+    }
+
+    // Busca histórico completo deste participante neste evento
+    var hist = await supabase.from('checkin_dias')
+      .select('dia, checkin_at')
+      .eq('participante_id', part.id)
+      .order('dia', { ascending: true })
+
+    setCheckinInfo({ dia: dia, jaTinha: jaTinha, historico: hist.data || [] })
+  }
+
   async function processToken(token) {
     stopCamera()
     setError('')
@@ -85,7 +151,7 @@ export default function CheckinPage() {
     if (r.error || !r.data) { setError('QR Code invalido.'); setMode('scan'); return }
     setParticipante(r.data)
     setEvento(r.data.eventos)
-    if (!r.data.checkin_at) await supabase.from('participantes').update({ checkin_at: new Date().toISOString(), checkin_por: auth.profile ? auth.profile.id : null }).eq('id', r.data.id)
+    await registrarCheckin(r.data, r.data.eventos)
     setMode('success')
   }
 
@@ -95,7 +161,7 @@ export default function CheckinPage() {
     var r = await supabase.from('participantes').select('*, eventos(*)').or('nome.ilike.%'+manualSearch+'%,telefone.ilike.%'+manualSearch+'%').limit(1).single()
     if (r.error || !r.data) { setError('Participante nao encontrado.'); return }
     setParticipante(r.data); setEvento(r.data.eventos)
-    if (!r.data.checkin_at) await supabase.from('participantes').update({ checkin_at: new Date().toISOString(), checkin_por: auth.profile ? auth.profile.id : null }).eq('id', r.data.id)
+    await registrarCheckin(r.data, r.data.eventos)
     setMode('success')
   }
 
@@ -111,11 +177,49 @@ export default function CheckinPage() {
     var n = venda.modalidade === 'A Vista' ? 1 : Number(venda.num_parcelas)
     var liq = Number(venda.valor_total) - Number(venda.desconto)
     var vlr = liq / n
-    var r2 = await supabase.from('financeiro').insert({ cliente_id:clienteId,modalidade:venda.modalidade,valor_total:venda.valor_total,desconto:venda.desconto,forma_pagamento:venda.forma_pagamento }).select().single()
-    if (r2.data) {
-      await supabase.from('parcelas').insert(Array.from({length:n},function(_,i){ return { financeiro_id:r2.data.id,numero:i+1,valor:parseFloat(vlr.toFixed(2)),status:'Pendente' } }))
+
+    // Distribui o resto de centavos na última parcela pra bater o total exato
+    var centavos = Math.round(liq * 100)
+    var vlrUnit = Math.floor(centavos / n) / 100
+    var vlrUltima = (centavos - Math.floor(centavos / n) * (n - 1)) / 100
+
+    // Vencimentos: primeira parcela em 30 dias, depois mensal.
+    // À vista: vencimento em 3 dias úteis (simples: +3 dias corridos).
+    function isoData(d) { return d.toISOString().slice(0,10) }
+    function somarMeses(base, m) {
+      var d = new Date(base.getTime())
+      var diaAlvo = d.getDate()
+      d.setDate(1); d.setMonth(d.getMonth() + m)
+      var ultimoDia = new Date(d.getFullYear(), d.getMonth()+1, 0).getDate()
+      d.setDate(Math.min(diaAlvo, ultimoDia))
+      return d
     }
-    setParticipante(function(p){ return {...p,comprou:true,_clienteId:clienteId,_finId:r2.data?r2.data.id:null} })
+    var hoje = new Date(); hoje.setHours(0,0,0,0)
+    var vencimentos
+    if (venda.modalidade === 'A Vista') {
+      var d = new Date(hoje); d.setDate(d.getDate() + 3)
+      vencimentos = [isoData(d)]
+    } else {
+      vencimentos = Array.from({ length: n }, function(_, i) { return isoData(somarMeses(hoje, i + 1)) })
+    }
+
+    var r2 = await supabase.from('financeiro')
+      .insert({ cliente_id:clienteId, modalidade:venda.modalidade, valor_total:venda.valor_total, desconto:venda.desconto, forma_pagamento:venda.forma_pagamento })
+      .select().single()
+
+    if (r2.data) {
+      var rows = Array.from({ length: n }, function(_, i) {
+        return {
+          financeiro_id: r2.data.id,
+          numero: i + 1,
+          valor: i === n - 1 ? vlrUltima : vlrUnit,
+          vencimento: vencimentos[i],
+          status: 'Pendente',
+        }
+      })
+      await supabase.from('parcelas').insert(rows)
+    }
+    setParticipante(function(p){ return {...p, comprou:true, _clienteId:clienteId, _finId:r2.data?r2.data.id:null} })
     setSaving(false)
     setMode('contrato')
   }
@@ -131,6 +235,7 @@ export default function CheckinPage() {
 
   function resetar() {
     setMode('scan'); setParticipante(null); setEvento(null); setError(''); setManualSearch('')
+    setCheckinInfo(null)
     setVenda({ modalidade:'Parcelado',num_parcelas:6,valor_total:4800,desconto:0,forma_pagamento:'Asaas' })
   }
 
@@ -190,12 +295,48 @@ export default function CheckinPage() {
 
         {/* SUCCESS */}
         {mode === 'success' && participante && (
-          <div style={{ width:'100%',maxWidth:440,textAlign:'center' }}>
-            <div style={{ fontSize:56,marginBottom:16 }}>✅</div>
-            <div style={{ fontSize:24,fontWeight:700,color:'#f0ead8',marginBottom:6 }}>Check-in Confirmado!</div>
+          <div style={{ width:'100%',maxWidth:460,textAlign:'center' }}>
+            <div style={{ fontSize:56,marginBottom:14 }}>{checkinInfo && checkinInfo.jaTinha ? '↩️' : '✅'}</div>
+            <div style={{ fontSize:24,fontWeight:700,color:'#f0ead8',marginBottom:6 }}>
+              {checkinInfo && checkinInfo.jaTinha ? 'Já Fez Check-in Hoje' : 'Check-in Confirmado!'}
+            </div>
             <div style={{ fontSize:18,color:'#c9a96e',marginBottom:4,fontWeight:600 }}>{participante.nome}</div>
             <div style={{ fontSize:13,color:'#7a6a4a',marginBottom:6,fontFamily:'monospace' }}>{participante.telefone}</div>
-            {evento && <div style={{ fontSize:13,color:'#7a6a4a',marginBottom:28 }}>📍 {evento.nome}</div>}
+            {evento && <div style={{ fontSize:13,color:'#7a6a4a',marginBottom:18 }}>📍 {evento.nome}</div>}
+
+            {/* Dias do evento — mostra status de check-in em cada um */}
+            {evento && checkinInfo && (() => {
+              var dias = listaDiasEvento(evento)
+              if (dias.length <= 1) return null
+              var histSet = {}
+              ;(checkinInfo.historico || []).forEach(function(h){ histSet[h.dia] = h.checkin_at })
+              return (
+                <div style={{ background:'#141209',border:'1px solid #2a2415',borderRadius:10,padding:'14px 16px',marginBottom:22,textAlign:'left' }}>
+                  <div style={{ fontSize:11,color:'#7a6a4a',textTransform:'uppercase',letterSpacing:'.1em',marginBottom:10 }}>Presença por dia</div>
+                  <div style={{ display:'flex',flexDirection:'column',gap:6 }}>
+                    {dias.map(function(d) {
+                      var marcado = !!histSet[d]
+                      var isHoje = d === checkinInfo.dia
+                      var p = d.split('-')
+                      var label = p[2]+'/'+p[1]
+                      return (
+                        <div key={d} style={{ display:'flex',alignItems:'center',justifyContent:'space-between',padding:'6px 8px',borderRadius:6,background: isHoje ? '#1c1810' : 'transparent' }}>
+                          <div style={{ display:'flex',alignItems:'center',gap:10 }}>
+                            <span style={{ width:18,display:'inline-block',color: marcado ? '#4ade80' : '#3d3420',fontWeight:700 }}>{marcado ? '✓' : '○'}</span>
+                            <span style={{ fontSize:13,color: marcado ? '#f0ead8' : '#7a6a4a',fontFamily:'monospace' }}>{label}</span>
+                            {isHoje && <span style={{ fontSize:10,color:'#c9a96e',textTransform:'uppercase',letterSpacing:'.1em' }}>hoje</span>}
+                          </div>
+                          <span style={{ fontSize:11,color:'#7a6a4a',fontFamily:'monospace' }}>
+                            {marcado ? new Date(histSet[d]).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}) : '—'}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )
+            })()}
+
             <div style={{ display:'flex',gap:12,justifyContent:'center',flexWrap:'wrap' }}>
               <button style={S.btnGhost} onClick={resetar}>Proximo Check-in</button>
               {!participante.comprou && <button style={S.btnG} onClick={function(){setMode('sale')}}>💰 Registrar Venda</button>}
