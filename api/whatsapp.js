@@ -38,6 +38,7 @@ export default async function handler(req, res) {
 
     // Ignorar grupos
     const chatId = body.chatId || ''
+    const chatLid = body.chatLid || ''
     if (chatId.includes('@g.us') || body.isGroup === true) {
       console.log('Ignorado: grupo')
       return res.status(200).json({ status: 'grupo_ignorado' })
@@ -58,26 +59,27 @@ export default async function handler(req, res) {
       (typeof body.message === 'string' ? body.message : '') ||
       ''
 
-    // Extrair telefone: preferir phone, senão usar senderPhone, senão chatId
-    const telefone =
-      body.phone ||
-      body.senderPhone ||
-      body.sender?.split('@')[0] ||
-      chatId.split('@')[0] ||
-      ''
+    // ── DESTINO: usar chatLid completo se disponível (suportado pela Z-API)
+    // Documentação Z-API: @lid pode ser usado diretamente como phone
+    const destino = chatLid || body.phone || chatId
 
+    // Chave para o histórico (usar parte numérica)
+    const chaveHistorico = destino.split('@')[0] || destino
+
+    console.log('chatLid:', chatLid)
     console.log('chatId:', chatId)
-    console.log('telefone:', telefone)
+    console.log('phone:', body.phone)
+    console.log('destino final:', destino)
     console.log('mensagem:', mensagem)
 
-    if (!mensagem || !telefone) {
-      console.log('Sem dados — ignorando')
+    if (!mensagem || !destino) {
+      console.log('Sem dados — ignorando. mensagem:', !!mensagem, 'destino:', !!destino)
       return res.status(200).json({ status: 'sem_dados' })
     }
 
-    // Histórico
-    if (!conversas[telefone]) conversas[telefone] = { historico: [], leadSalvo: false, telefoneReal: null }
-    const conv = conversas[telefone]
+    // Histórico de conversa
+    if (!conversas[chaveHistorico]) conversas[chaveHistorico] = { historico: [], leadSalvo: false }
+    const conv = conversas[chaveHistorico]
     conv.historico.push({ role: 'user', content: mensagem })
     if (conv.historico.length > 20) conv.historico = conv.historico.slice(-20)
 
@@ -100,6 +102,11 @@ export default async function handler(req, res) {
 
     const iaData = await iaRes.json()
     console.log('IA status:', iaRes.status)
+    if (iaRes.status !== 200) {
+      console.error('Erro IA:', JSON.stringify(iaData))
+      return res.status(200).json({ status: 'erro_ia' })
+    }
+
     const resposta = iaData.content?.[0]?.text || 'Oi! Sou a Andréia da equipe do Lucas Labastie. Como posso te ajudar?'
     console.log('Resposta IA:', resposta.substring(0, 150))
 
@@ -108,7 +115,7 @@ export default async function handler(req, res) {
     if (leadMatch && !conv.leadSalvo) {
       try {
         const lead = JSON.parse(leadMatch[1])
-        lead.telefone = lead.telefone || telefone
+        lead.telefone = lead.telefone || body.phone || chaveHistorico
         await fetch(`${process.env.SUPABASE_URL}/functions/v1/captar-lead`, {
           method: 'POST',
           headers: {
@@ -118,7 +125,7 @@ export default async function handler(req, res) {
           },
           body: JSON.stringify(lead)
         })
-        console.log('Lead salvo:', lead)
+        console.log('✅ Lead salvo:', lead)
         conv.leadSalvo = true
       } catch (e) {
         console.error('Erro lead:', e.message)
@@ -128,51 +135,18 @@ export default async function handler(req, res) {
     const respostaFinal = resposta.replace(/DADOS_LEAD:\{.*?\}/s, '').trim()
     conv.historico.push({ role: 'assistant', content: resposta })
 
-    // ── Enviar resposta ──────────────────────────────────────
-    // Tentar 3 formatos diferentes de destino
-    const tentativas = []
+    // ── Enviar via Z-API usando destino completo (com @lid se necessário)
+    console.log('Enviando para Z-API:', destino)
+    const zapiRes = await fetch(`${baseUrl}/send-text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: destino, message: respostaFinal })
+    })
 
-    // 1. Se tiver phone direto
-    if (body.phone) tentativas.push(body.phone)
+    const zapiText = await zapiRes.text()
+    console.log('Z-API status:', zapiRes.status, '| resposta:', zapiText)
 
-    // 2. Número puro do chatId (funciona quando é @c.us)
-    if (chatId.includes('@c.us')) tentativas.push(chatId.split('@')[0])
-
-    // 3. chatId completo (funciona para alguns casos)
-    if (chatId) tentativas.push(chatId)
-
-    // 4. Número puro sem @lid
-    if (chatId.includes('@lid')) tentativas.push(chatId.split('@')[0])
-
-    console.log('Tentativas de envio:', tentativas)
-
-    let enviado = false
-    for (const destino of tentativas) {
-      if (enviado) break
-      try {
-        console.log('Tentando enviar para:', destino)
-        const zapiRes = await fetch(`${baseUrl}/send-text`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ phone: destino, message: respostaFinal })
-        })
-        const zapiText = await zapiRes.text()
-        console.log(`Z-API [${destino}] status:`, zapiRes.status, '| body:', zapiText)
-
-        if (zapiRes.status === 200 || zapiRes.status === 201) {
-          enviado = true
-          console.log('✅ Enviado com sucesso para:', destino)
-        }
-      } catch (e) {
-        console.error('Erro tentativa', destino, ':', e.message)
-      }
-    }
-
-    if (!enviado) {
-      console.error('❌ Não foi possível enviar para nenhum destino')
-    }
-
-    return res.status(200).json({ ok: true, enviado })
+    return res.status(200).json({ ok: true, zapiStatus: zapiRes.status })
 
   } catch (err) {
     console.error('ERRO GERAL:', err.message)
