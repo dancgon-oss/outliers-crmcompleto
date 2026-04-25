@@ -17,6 +17,10 @@
 -- ║ PARTE 1 — CHECK-IN MULTI-DIA + ENVIOS DE QR              ║
 -- ╚══════════════════════════════════════════════════════════╝
 
+-- Existe uma versão antiga de checkin_dias com schema diferente (dia integer
+-- em vez de date, evento_id direto). Como está vazia, dropamos e recriamos.
+drop table if exists public.checkin_dias cascade;
+
 create table if not exists public.checkin_dias (
   id              uuid default gen_random_uuid() primary key,
   participante_id uuid references public.participantes(id) on delete cascade not null,
@@ -89,6 +93,9 @@ alter table public.profiles
   check (role in ('admin', 'comercial', 'financeiro', 'operacional', 'aluno'));
 
 
+-- A tabela cursos pode já existir com schema diferente (preco_padrao, categoria
+-- em vez de slug, capa_url, duracao_horas, preco_avulso). Se existir com dados,
+-- adicionamos só as colunas que faltam — não destruímos o existente.
 create table if not exists public.cursos (
   id             uuid default gen_random_uuid() primary key,
   nome           text not null,
@@ -103,7 +110,27 @@ create table if not exists public.cursos (
   updated_at     timestamptz default now()
 );
 
-create index if not exists idx_cursos_slug on public.cursos(slug);
+-- Compat: adiciona colunas que minhas pages esperam, caso a tabela já existisse
+-- com schema antigo (preco_padrao, categoria). preco_padrao/categoria ficam
+-- intactos — não atrapalham.
+alter table public.cursos add column if not exists slug          text;
+alter table public.cursos add column if not exists capa_url      text;
+alter table public.cursos add column if not exists duracao_horas numeric(6,2);
+alter table public.cursos add column if not exists preco_avulso  numeric(10,2);
+alter table public.cursos add column if not exists ordem         int default 0;
+alter table public.cursos add column if not exists ativo         boolean default true;
+
+-- Garante que slug seja único quando preenchido (constraint condicional)
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'cursos_slug_key'
+  ) then
+    -- Cria índice único parcial em vez de UNIQUE constraint pra permitir slugs nulos
+    create unique index if not exists cursos_slug_unique on public.cursos(slug) where slug is not null;
+  end if;
+end $$;
+
 create index if not exists idx_cursos_ativo on public.cursos(ativo);
 
 
