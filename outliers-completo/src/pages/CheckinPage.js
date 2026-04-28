@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, forwardRef, useImperativeHandle, useCallba
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../lib/AuthContext'
 import { fmt, fmtDate, C } from '../lib/ui'
+import { registrarVendaOutliers } from '../lib/vendas'
 
 var SignaturePad = forwardRef(function(props, ref) {
   var canvasRef = useRef(null)
@@ -168,60 +169,22 @@ export default function CheckinPage() {
   async function registrarVenda() {
     if (!participante) return
     setSaving(true)
-    var clienteId = participante.cliente_id
-    if (!clienteId) {
-      var r = await supabase.from('clientes').insert({ nome:participante.nome,email:participante.email,telefone:participante.telefone,cpf:participante.cpf,origem:'Paradigma',status:'Ativo',programa:'Outliers',evento_origem_id:evento?evento.id:null,criado_por:auth.profile?auth.profile.id:null }).select().single()
-      clienteId = r.data ? r.data.id : null
-      await supabase.from('participantes').update({ cliente_id:clienteId,comprou:true }).eq('id',participante.id)
-    }
-    var n = venda.modalidade === 'A Vista' ? 1 : Number(venda.num_parcelas)
-    var liq = Number(venda.valor_total) - Number(venda.desconto)
-    var vlr = liq / n
-
-    // Distribui o resto de centavos na última parcela pra bater o total exato
-    var centavos = Math.round(liq * 100)
-    var vlrUnit = Math.floor(centavos / n) / 100
-    var vlrUltima = (centavos - Math.floor(centavos / n) * (n - 1)) / 100
-
-    // Vencimentos: primeira parcela em 30 dias, depois mensal.
-    // À vista: vencimento em 3 dias úteis (simples: +3 dias corridos).
-    function isoData(d) { return d.toISOString().slice(0,10) }
-    function somarMeses(base, m) {
-      var d = new Date(base.getTime())
-      var diaAlvo = d.getDate()
-      d.setDate(1); d.setMonth(d.getMonth() + m)
-      var ultimoDia = new Date(d.getFullYear(), d.getMonth()+1, 0).getDate()
-      d.setDate(Math.min(diaAlvo, ultimoDia))
-      return d
-    }
-    var hoje = new Date(); hoje.setHours(0,0,0,0)
-    var vencimentos
-    if (venda.modalidade === 'A Vista') {
-      var d = new Date(hoje); d.setDate(d.getDate() + 3)
-      vencimentos = [isoData(d)]
-    } else {
-      vencimentos = Array.from({ length: n }, function(_, i) { return isoData(somarMeses(hoje, i + 1)) })
-    }
-
-    var r2 = await supabase.from('financeiro')
-      .insert({ cliente_id:clienteId, modalidade:venda.modalidade, valor_total:venda.valor_total, desconto:venda.desconto, forma_pagamento:venda.forma_pagamento })
-      .select().single()
-
-    if (r2.data) {
-      var rows = Array.from({ length: n }, function(_, i) {
-        return {
-          financeiro_id: r2.data.id,
-          numero: i + 1,
-          valor: i === n - 1 ? vlrUltima : vlrUnit,
-          vencimento: vencimentos[i],
-          status: 'Pendente',
-        }
+    try {
+      var resp = await registrarVendaOutliers({
+        participante: participante,
+        eventoId: evento ? evento.id : null,
+        venda: venda,
+        userId: auth.profile ? auth.profile.id : null,
       })
-      await supabase.from('parcelas').insert(rows)
+      setParticipante(function(p) {
+        return { ...p, comprou: true, cliente_id: resp.cliente_id, _clienteId: resp.cliente_id, _finId: resp.financeiro_id }
+      })
+      setMode('contrato')
+    } catch (e) {
+      setError(e.message || 'Falha ao registrar venda')
+    } finally {
+      setSaving(false)
     }
-    setParticipante(function(p){ return {...p, comprou:true, _clienteId:clienteId, _finId:r2.data?r2.data.id:null} })
-    setSaving(false)
-    setMode('contrato')
   }
 
   async function assinarContrato() {

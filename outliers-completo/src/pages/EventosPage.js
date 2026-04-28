@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../lib/AuthContext'
-import { fmtDate, C } from '../lib/ui'
+import { fmtDate, fmt, C } from '../lib/ui'
+import { registrarVendaOutliers } from '../lib/vendas'
 import QRCode from 'qrcode'
 
 export default function EventosPage() {
@@ -17,6 +18,11 @@ export default function EventosPage() {
   var [saving, setSaving] = useState(false)
   var [sending, setSending] = useState(false)
   var [sendResult, setSendResult] = useState(null)
+  // Venda Outliers — abre modal com formulário pré-preenchido
+  var [vendaPart, setVendaPart] = useState(null)
+  var [vendaForm, setVendaForm] = useState({ modalidade: 'Parcelado', num_parcelas: 6, valor_total: 4800, desconto: 0, forma_pagamento: 'Asaas' })
+  var [vendaErr, setVendaErr] = useState('')
+  var [vendaOk, setVendaOk] = useState(null)
   var [novoEvento, setNovoEvento] = useState({ nome: 'Paradigma', tipo: 'Paradigma', data_inicio: '', data_fim: '', local: '', descricao: '' })
   var [novoPart, setNovoPart] = useState({ nome: '', email: '', telefone: '', cpf: '' })
   var [search, setSearch] = useState('')
@@ -49,6 +55,31 @@ export default function EventosPage() {
     await fetchParticipantes(selected.id)
     setShowNovoPart(false)
     setNovoPart({ nome:'',email:'',telefone:'',cpf:'' })
+    setSaving(false)
+  }
+
+  function abrirVenda(part) {
+    setVendaPart(part)
+    setVendaForm({ modalidade: 'Parcelado', num_parcelas: 6, valor_total: 4800, desconto: 0, forma_pagamento: 'Asaas' })
+    setVendaErr(''); setVendaOk(null)
+  }
+
+  async function confirmarVenda() {
+    if (!vendaPart) return
+    setSaving(true); setVendaErr('')
+    try {
+      var resp = await registrarVendaOutliers({
+        participante: vendaPart,
+        eventoId: selected ? selected.id : null,
+        venda: vendaForm,
+        userId: auth.profile ? auth.profile.id : null,
+      })
+      setVendaOk(resp)
+      // refresh da lista
+      if (selected) await fetchParticipantes(selected.id)
+    } catch (e) {
+      setVendaErr(e.message || 'Falha ao registrar venda')
+    }
     setSaving(false)
   }
 
@@ -329,7 +360,15 @@ export default function EventosPage() {
                         ? <span title={new Date(p.qr_enviado_em).toLocaleString('pt-BR')} style={{ color: '#4ade80', fontWeight: 600 }}>✓ Enviado</span>
                         : <span style={{ color: C.text3 }}>—</span>}
                     </div>
-                    <div style={{ fontSize: 11 }}>{p.comprou ? <span style={{ color: C.gold, fontWeight: 600 }}>Sim</span> : <span style={{ color: C.text3 }}>—</span>}</div>
+                    <div style={{ fontSize: 11 }}>
+                      {p.comprou
+                        ? <span style={{ color: C.gold, fontWeight: 600 }}>Sim</span>
+                        : <button onClick={function(){ abrirVenda(p) }}
+                            style={{ background:'#14532d22', border:'1px solid #14532d', color:'#4ade80', padding:'3px 8px', borderRadius:6, cursor:'pointer', fontSize:11, fontWeight:600, fontFamily:'Inter,sans-serif' }}>
+                            + Vender
+                          </button>
+                      }
+                    </div>
                     <div style={{ fontSize: 11 }}>{p.comprou ? <span style={{ color: '#4ade80' }}>✓</span> : <span style={{ color: C.text3 }}>—</span>}</div>
                     <button style={{ ...S.btnGhost, padding: '4px 10px', fontSize: 11 }} onClick={function(){ abrirQR(p) }}>QR ↗</button>
                   </div>
@@ -378,6 +417,94 @@ export default function EventosPage() {
               <button style={S.btnGhost} onClick={function(){setShowNovoPart(false)}}>Cancelar</button>
               <button style={S.btnG} onClick={salvarParticipante} disabled={saving||!novoPart.nome||!novoPart.telefone}>{saving?'Salvando...':'Adicionar'}</button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Vender Outliers */}
+      {vendaPart && (
+        <div style={S.overlay} onClick={function(){ if (!saving) { setVendaPart(null); setVendaOk(null) } }}>
+          <div style={S.modal} onClick={function(e){ e.stopPropagation() }}>
+            {!vendaOk ? (<>
+              <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Vender programa Outliers</div>
+              <div style={{ fontSize: 13, color: C.gold, marginBottom: 18 }}>{vendaPart.nome} · {vendaPart.telefone}</div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <div style={{ display: 'flex', gap: 12 }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={S.lbl}>Modalidade</label>
+                    <select style={S.inp} value={vendaForm.modalidade} onChange={function(e){ setVendaForm(function(p){ return { ...p, modalidade: e.target.value } }) }}>
+                      <option>Parcelado</option><option>A Vista</option>
+                    </select>
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <label style={S.lbl}>Forma de pagamento</label>
+                    <select style={S.inp} value={vendaForm.forma_pagamento} onChange={function(e){ setVendaForm(function(p){ return { ...p, forma_pagamento: e.target.value } }) }}>
+                      <option>Asaas</option><option>PIX</option><option>Cartão</option><option>Boleto</option>
+                    </select>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: 12 }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={S.lbl}>Valor total (R$)</label>
+                    <input style={S.inp} type="number" step="0.01" value={vendaForm.valor_total} onChange={function(e){ setVendaForm(function(p){ return { ...p, valor_total: Number(e.target.value) } }) }} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <label style={S.lbl}>Desconto (R$)</label>
+                    <input style={S.inp} type="number" step="0.01" value={vendaForm.desconto} onChange={function(e){ setVendaForm(function(p){ return { ...p, desconto: Number(e.target.value) } }) }} />
+                  </div>
+                </div>
+                {vendaForm.modalidade === 'Parcelado' && (
+                  <div style={{ width: '50%' }}>
+                    <label style={S.lbl}>Número de parcelas</label>
+                    <select style={S.inp} value={vendaForm.num_parcelas} onChange={function(e){ setVendaForm(function(p){ return { ...p, num_parcelas: Number(e.target.value) } }) }}>
+                      {[2,3,4,5,6,7,8,9,10,11,12].map(function(n){ return <option key={n} value={n}>{n}x</option> })}
+                    </select>
+                  </div>
+                )}
+                {/* Resumo */}
+                <div style={{ background: C.bgHover, border: '1px solid ' + C.border, borderRadius: 8, padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div>
+                    <div style={{ fontSize: 11, color: C.text3, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Valor líquido</div>
+                    <div style={{ fontSize: 22, fontWeight: 700, color: C.gold }}>{fmt(vendaForm.valor_total - vendaForm.desconto)}</div>
+                  </div>
+                  {vendaForm.modalidade === 'Parcelado' && vendaForm.num_parcelas > 0 && (
+                    <div style={{ textAlign: 'right' }}>
+                      <div style={{ fontSize: 11, color: C.text3 }}>{vendaForm.num_parcelas}x mensais de</div>
+                      <div style={{ fontSize: 16, fontWeight: 600, color: C.text }}>{fmt((vendaForm.valor_total - vendaForm.desconto) / vendaForm.num_parcelas)}</div>
+                    </div>
+                  )}
+                </div>
+                <div style={{ fontSize: 11, color: C.text3, lineHeight: 1.5 }}>
+                  Ao confirmar, vamos: criar/atualizar o cliente <b>{vendaPart.nome}</b> no CRM como cliente Outliers,
+                  marcar este participante como comprador, gerar registro financeiro e {vendaForm.modalidade === 'A Vista' ? '1 parcela' : vendaForm.num_parcelas + ' parcelas'} com vencimento mensal.
+                </div>
+              </div>
+
+              {vendaErr && <div style={{ marginTop: 14, background: '#7f1d1d22', border: '1px solid #7f1d1d', color: '#fca5a5', padding: '10px 14px', fontSize: 13, borderRadius: 8 }}>{vendaErr}</div>}
+
+              <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 22 }}>
+                <button style={S.btnGhost} onClick={function(){ setVendaPart(null) }} disabled={saving}>Cancelar</button>
+                <button style={S.btnG} onClick={confirmarVenda} disabled={saving || !vendaForm.valor_total}>{saving ? 'Salvando...' : 'Confirmar venda'}</button>
+              </div>
+            </>) : (<>
+              <div style={{ textAlign: 'center', marginBottom: 20 }}>
+                <div style={{ fontSize: 44, marginBottom: 10 }}>🎉</div>
+                <div style={{ fontSize: 20, fontWeight: 700, color: C.text, marginBottom: 6 }}>Venda registrada!</div>
+                <div style={{ fontSize: 13, color: C.text2 }}>{vendaPart.nome} agora é cliente <b style={{ color: C.gold }}>Outliers</b>.</div>
+              </div>
+              <div style={{ background: C.bgHover, border: '1px solid ' + C.border, borderRadius: 8, padding: '14px 16px', fontSize: 13, color: C.text2, lineHeight: 1.7 }}>
+                ✓ Cliente atualizado (programa = Outliers, pipeline = Ganho)<br/>
+                ✓ Registro financeiro criado<br/>
+                ✓ {vendaOk.parcelas} parcela{vendaOk.parcelas !== 1 ? 's' : ''} com vencimento mensal
+              </div>
+              <div style={{ marginTop: 14, fontSize: 12, color: C.text3, lineHeight: 1.5 }}>
+                Próximos passos: vá em <b>Financeiro → {vendaPart.nome}</b> e clique em <b>"+ Emitir N pendentes"</b> pra gerar as cobranças no Asaas.
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 20 }}>
+                <button style={S.btnG} onClick={function(){ setVendaPart(null); setVendaOk(null) }}>Fechar</button>
+              </div>
+            </>)}
           </div>
         </div>
       )}
