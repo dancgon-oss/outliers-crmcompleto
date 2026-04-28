@@ -42,7 +42,8 @@ export function AuthProvider({ children }) {
       isAluno:      role === 'aluno',
       isStaff:      role === 'admin' || role === 'comercial' || role === 'financeiro' || role === 'operacional',
       // Helpers de acesso
-      canSeeFinanceiro: role === 'admin' || role === 'comercial' || role === 'financeiro',
+      // Financeiro: só admin e financeiro (vendedores/comercial não veem R$)
+      canSeeFinanceiro: role === 'admin' || role === 'financeiro',
       canEditClientes:  role === 'admin' || role === 'comercial' || role === 'financeiro',
       canDeleteClientes:role === 'admin' || role === 'comercial',
       canManageEventos: role === 'admin' || role === 'comercial',

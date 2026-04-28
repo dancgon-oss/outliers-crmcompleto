@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
+import { useAuth } from '../lib/AuthContext'
 import { fmt, fmtDate, diasAteVencer, C } from '../lib/ui'
 
 function StatCard({ label, value, sub, color, icon }) {
@@ -16,6 +17,8 @@ function StatCard({ label, value, sub, color, icon }) {
 }
 
 export default function DashboardPage({ onNav }) {
+  var auth = useAuth()
+  var verFin = auth.canSeeFinanceiro    // admin + financeiro só
   var [stats, setStats] = useState({ clientes: 0, ativos: 0, inad: 0, recebido: 0, pendente: 0, atrasado: 0 })
   var [alertas, setAlertas] = useState([])
   var [receitaMensal, setReceitaMensal] = useState([])
@@ -91,17 +94,20 @@ export default function DashboardPage({ onNav }) {
         <div style={{ color: C.text3, fontStyle: 'italic' }}>Carregando...</div>
       ) : (<>
 
-        {/* KPI Cards */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 16, marginBottom: 28 }}>
+        {/* KPI Cards — financeiros só pra admin/financeiro */}
+        <div style={{ display: 'grid', gridTemplateColumns: verFin ? 'repeat(3,1fr)' : 'repeat(2,1fr)', gap: 16, marginBottom: 28 }}>
           <StatCard label="Total Clientes"  value={stats.clientes} sub={stats.ativos + ' ativos'}           icon="👥" />
           <StatCard label="Inadimplentes"   value={stats.inad}     sub="clientes em atraso"                  icon="⚠️" color={stats.inad > 0 ? C.red : C.text} />
-          <StatCard label="Receita Total"   value={fmt(stats.recebido + stats.pendente)} sub="faturado"      icon="💰" color={C.gold} />
-          <StatCard label="Recebido"        value={fmt(stats.recebido)}  sub="ja pago pelos clientes"        icon="✅" color="#4ade80" />
-          <StatCard label="A Receber"       value={fmt(stats.pendente)}  sub="parcelas pendentes"            icon="⏳" />
-          <StatCard label="Em Atraso"       value={fmt(stats.atrasado)}  sub="parcelas atrasadas"            icon="🔴" color={stats.atrasado > 0 ? C.red : C.text} />
+          {verFin && <>
+            <StatCard label="Receita Total"   value={fmt(stats.recebido + stats.pendente)} sub="faturado"      icon="💰" color={C.gold} />
+            <StatCard label="Recebido"        value={fmt(stats.recebido)}  sub="ja pago pelos clientes"        icon="✅" color="#4ade80" />
+            <StatCard label="A Receber"       value={fmt(stats.pendente)}  sub="parcelas pendentes"            icon="⏳" />
+            <StatCard label="Em Atraso"       value={fmt(stats.atrasado)}  sub="parcelas atrasadas"            icon="🔴" color={stats.atrasado > 0 ? C.red : C.text} />
+          </>}
         </div>
 
-        {/* Charts + Alertas */}
+        {/* Charts + Alertas (financeiros — só pra quem pode ver R$) */}
+        {verFin && (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 380px', gap: 20 }}>
 
           {/* Receita mensal */}
@@ -151,6 +157,26 @@ export default function DashboardPage({ onNav }) {
             </button>
           </div>
         </div>
+        )}
+
+        {/* Atalho pra vendedores irem pro Pipeline (sem widgets financeiros) */}
+        {!verFin && (
+          <div style={{ background: C.bgCard, border: '1px solid ' + C.border, borderRadius: 12, padding: '22px 24px' }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: C.text, marginBottom: 6 }}>Atalhos rápidos</div>
+            <div style={{ fontSize: 12, color: C.text3, marginBottom: 14 }}>Acesso direto às frentes comerciais.</div>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              <button onClick={function(){ onNav('pipeline') }} style={{ background: 'linear-gradient(135deg,#c9a96e,#a07840)', color: '#0a0900', border: 'none', padding: '10px 18px', borderRadius: 8, fontFamily: 'Inter,sans-serif', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
+                Ver Pipeline →
+              </button>
+              <button onClick={function(){ onNav('clientes') }} style={{ background: 'none', border: '1px solid ' + C.border2, color: C.text2, padding: '10px 18px', borderRadius: 8, fontFamily: 'Inter,sans-serif', fontSize: 13, cursor: 'pointer' }}>
+                Lista de clientes
+              </button>
+              <button onClick={function(){ onNav('eventos') }} style={{ background: 'none', border: '1px solid ' + C.border2, color: C.text2, padding: '10px 18px', borderRadius: 8, fontFamily: 'Inter,sans-serif', fontSize: 13, cursor: 'pointer' }}>
+                Eventos
+              </button>
+            </div>
+          </div>
+        )}
       </>)}
     </div>
   )
