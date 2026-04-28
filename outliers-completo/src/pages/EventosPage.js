@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../lib/AuthContext'
 import { fmtDate, fmt, C } from '../lib/ui'
-import { registrarVendaOutliers } from '../lib/vendas'
+import { registrarVenda } from '../lib/vendas'
 import QRCode from 'qrcode'
 
 export default function EventosPage() {
@@ -18,11 +18,13 @@ export default function EventosPage() {
   var [saving, setSaving] = useState(false)
   var [sending, setSending] = useState(false)
   var [sendResult, setSendResult] = useState(null)
-  // Venda Outliers — abre modal com formulário pré-preenchido
+  // Venda — abre modal com formulário pré-preenchido
   var [vendaPart, setVendaPart] = useState(null)
-  var [vendaForm, setVendaForm] = useState({ modalidade: 'Parcelado', num_parcelas: 6, valor_total: 4800, desconto: 0, forma_pagamento: 'Asaas' })
+  var [vendaForm, setVendaForm] = useState({ curso_id: '', modalidade: 'Parcelado', num_parcelas: 6, valor_total: 0, desconto: 0, forma_pagamento: 'Asaas' })
   var [vendaErr, setVendaErr] = useState('')
   var [vendaOk, setVendaOk] = useState(null)
+  var [cursos, setCursos] = useState([])
+  var [vendasMap, setVendasMap] = useState({}) // cliente_id -> count
   var [novoEvento, setNovoEvento] = useState({ nome: 'Paradigma', tipo: 'Paradigma', data_inicio: '', data_fim: '', local: '', descricao: '' })
   var [novoPart, setNovoPart] = useState({ nome: '', email: '', telefone: '', cpf: '' })
   var [search, setSearch] = useState('')
@@ -38,8 +40,27 @@ export default function EventosPage() {
 
   async function fetchParticipantes(id) {
     var { data } = await supabase.from('participantes').select('*').eq('evento_id', id).order('created_at')
-    setParticipantes(data || [])
+    var lista = data || []
+    setParticipantes(lista)
+
+    // Carrega contagem de vendas dos clientes vinculados a esses participantes
+    var clienteIds = lista.map(function(p){ return p.cliente_id }).filter(Boolean)
+    if (clienteIds.length) {
+      var { data: fins } = await supabase.from('financeiro').select('cliente_id').in('cliente_id', clienteIds)
+      var counts = {}
+      ;(fins || []).forEach(function(f){ counts[f.cliente_id] = (counts[f.cliente_id] || 0) + 1 })
+      setVendasMap(counts)
+    } else {
+      setVendasMap({})
+    }
   }
+
+  async function fetchCursos() {
+    var { data } = await supabase.from('cursos').select('id,nome,slug,categoria,preco_padrao,preco_avulso,ativo').eq('ativo', true).order('ordem').order('nome')
+    setCursos(data || [])
+  }
+
+  useEffect(function() { fetchCursos() }, [])
 
   async function salvarEvento() {
     setSaving(true)
@@ -60,22 +81,49 @@ export default function EventosPage() {
 
   function abrirVenda(part) {
     setVendaPart(part)
-    setVendaForm({ modalidade: 'Parcelado', num_parcelas: 6, valor_total: 4800, desconto: 0, forma_pagamento: 'Asaas' })
+    // Default: tenta achar curso "Outliers" ativo, senão usa o primeiro
+    var defaultCurso = cursos.find(function(c){ return /outliers/i.test(c.nome) || /outliers/i.test(c.slug || '') }) || cursos[0]
+    var preco = defaultCurso ? Number(defaultCurso.preco_padrao || defaultCurso.preco_avulso || 0) : 0
+    setVendaForm({
+      curso_id: defaultCurso ? defaultCurso.id : '',
+      modalidade: 'Parcelado',
+      num_parcelas: 6,
+      valor_total: preco || 4800,
+      desconto: 0,
+      forma_pagamento: 'Asaas',
+    })
     setVendaErr(''); setVendaOk(null)
+  }
+
+  function selecionarCurso(cursoId) {
+    var c = cursos.find(function(x){ return x.id === cursoId })
+    var preco = c ? Number(c.preco_padrao || c.preco_avulso || 0) : 0
+    setVendaForm(function(p){
+      return {
+        ...p,
+        curso_id: cursoId,
+        valor_total: preco || p.valor_total,
+      }
+    })
   }
 
   async function confirmarVenda() {
     if (!vendaPart) return
+    if (!vendaForm.curso_id) { setVendaErr('Escolha o curso/produto'); return }
     setSaving(true); setVendaErr('')
     try {
-      var resp = await registrarVendaOutliers({
+      // Se o curso vendido é o programa Outliers, atualiza programa do cliente
+      var cursoSel = cursos.find(function(c){ return c.id === vendaForm.curso_id })
+      var ehOutliers = cursoSel && (/outliers/i.test(cursoSel.nome) || /outliers/i.test(cursoSel.slug || ''))
+      var resp = await registrarVenda({
         participante: vendaPart,
         eventoId: selected ? selected.id : null,
         venda: vendaForm,
+        cursoId: vendaForm.curso_id,
+        atualizarPrograma: ehOutliers ? 'Outliers' : null,
         userId: auth.profile ? auth.profile.id : null,
       })
-      setVendaOk(resp)
-      // refresh da lista
+      setVendaOk({ ...resp, cursoNome: cursoSel ? cursoSel.nome : '' })
       if (selected) await fetchParticipantes(selected.id)
     } catch (e) {
       setVendaErr(e.message || 'Falha ao registrar venda')
@@ -339,7 +387,7 @@ export default function EventosPage() {
 
             <div style={S.card}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 130px 110px 100px 70px 70px 90px', padding: '10px 16px', borderBottom: '1px solid ' + C.border }}>
-                {['Nome','Telefone','Check-in','QR WhatsApp','Comprou','Contrato','Ações'].map(function(h,i){ return <span key={i} style={{ fontSize: 10, fontWeight: 600, color: C.text3, textTransform: 'uppercase', letterSpacing: '0.08em' }}>{h}</span> })}
+                {['Nome','Telefone','Check-in','QR WhatsApp','Vendas','Contrato','Ações'].map(function(h,i){ return <span key={i} style={{ fontSize: 10, fontWeight: 600, color: C.text3, textTransform: 'uppercase', letterSpacing: '0.08em' }}>{h}</span> })}
               </div>
               {filtrados.length === 0 && <div style={{ padding: 30, textAlign: 'center', color: C.text3, fontSize: 13, fontStyle: 'italic' }}>Nenhum participante.</div>}
               {filtrados.map(function(p, i, arr) {
@@ -360,14 +408,15 @@ export default function EventosPage() {
                         ? <span title={new Date(p.qr_enviado_em).toLocaleString('pt-BR')} style={{ color: '#4ade80', fontWeight: 600 }}>✓ Enviado</span>
                         : <span style={{ color: C.text3 }}>—</span>}
                     </div>
-                    <div style={{ fontSize: 11 }}>
-                      {p.comprou
-                        ? <span style={{ color: C.gold, fontWeight: 600 }}>Sim</span>
-                        : <button onClick={function(){ abrirVenda(p) }}
-                            style={{ background:'#14532d22', border:'1px solid #14532d', color:'#4ade80', padding:'3px 8px', borderRadius:6, cursor:'pointer', fontSize:11, fontWeight:600, fontFamily:'Inter,sans-serif' }}>
-                            + Vender
-                          </button>
-                      }
+                    <div style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 6 }}>
+                      {(function(){
+                        var n = (p.cliente_id && vendasMap[p.cliente_id]) || 0
+                        return n > 0 ? <span style={{ color: C.gold, fontWeight: 600 }} title={n + ' venda(s) registrada(s)'}>{n}×</span> : null
+                      })()}
+                      <button onClick={function(){ abrirVenda(p) }}
+                        style={{ background:'#14532d22', border:'1px solid #14532d', color:'#4ade80', padding:'3px 8px', borderRadius:6, cursor:'pointer', fontSize:11, fontWeight:600, fontFamily:'Inter,sans-serif' }}>
+                        + Vender
+                      </button>
                     </div>
                     <div style={{ fontSize: 11 }}>{p.comprou ? <span style={{ color: '#4ade80' }}>✓</span> : <span style={{ color: C.text3 }}>—</span>}</div>
                     <button style={{ ...S.btnGhost, padding: '4px 10px', fontSize: 11 }} onClick={function(){ abrirQR(p) }}>QR ↗</button>
@@ -426,10 +475,25 @@ export default function EventosPage() {
         <div style={S.overlay} onClick={function(){ if (!saving) { setVendaPart(null); setVendaOk(null) } }}>
           <div style={S.modal} onClick={function(e){ e.stopPropagation() }}>
             {!vendaOk ? (<>
-              <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Vender programa Outliers</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Registrar venda</div>
               <div style={{ fontSize: 13, color: C.gold, marginBottom: 18 }}>{vendaPart.nome} · {vendaPart.telefone}</div>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <div>
+                  <label style={S.lbl}>Curso / Produto *</label>
+                  <select style={S.inp} value={vendaForm.curso_id} onChange={function(e){ selecionarCurso(e.target.value) }}>
+                    <option value="">— escolha um produto —</option>
+                    {cursos.map(function(c) {
+                      var preco = c.preco_padrao || c.preco_avulso
+                      return (
+                        <option key={c.id} value={c.id}>
+                          {c.nome}{c.categoria ? ' (' + c.categoria + ')' : ''}{preco ? ' — ' + fmt(preco) : ''}
+                        </option>
+                      )
+                    })}
+                  </select>
+                  {!cursos.length && <div style={{ fontSize: 11, color: C.text3, marginTop: 4 }}>Nenhum curso cadastrado. Crie em <b>Cursos</b> primeiro.</div>}
+                </div>
                 <div style={{ display: 'flex', gap: 12 }}>
                   <div style={{ flex: 1 }}>
                     <label style={S.lbl}>Modalidade</label>
@@ -491,12 +555,12 @@ export default function EventosPage() {
               <div style={{ textAlign: 'center', marginBottom: 20 }}>
                 <div style={{ fontSize: 44, marginBottom: 10 }}>🎉</div>
                 <div style={{ fontSize: 20, fontWeight: 700, color: C.text, marginBottom: 6 }}>Venda registrada!</div>
-                <div style={{ fontSize: 13, color: C.text2 }}>{vendaPart.nome} agora é cliente <b style={{ color: C.gold }}>Outliers</b>.</div>
+                <div style={{ fontSize: 13, color: C.text2 }}>{vendaPart.nome} comprou <b style={{ color: C.gold }}>{vendaOk.cursoNome || 'o produto'}</b>.</div>
               </div>
               <div style={{ background: C.bgHover, border: '1px solid ' + C.border, borderRadius: 8, padding: '14px 16px', fontSize: 13, color: C.text2, lineHeight: 1.7 }}>
-                ✓ Cliente atualizado (programa = Outliers, pipeline = Ganho)<br/>
+                ✓ Cliente {vendaOk.cliente_id === vendaPart.cliente_id ? 'atualizado' : 'criado'} no CRM (pipeline = Ganho)<br/>
                 ✓ Registro financeiro criado<br/>
-                ✓ {vendaOk.parcelas} parcela{vendaOk.parcelas !== 1 ? 's' : ''} com vencimento mensal
+                ✓ {vendaOk.parcelas} parcela{vendaOk.parcelas !== 1 ? 's' : ''} com vencimento mensal (1ª = entrada na data de hoje)
               </div>
               <div style={{ marginTop: 14, fontSize: 12, color: C.text3, lineHeight: 1.5 }}>
                 Próximos passos: vá em <b>Financeiro → {vendaPart.nome}</b> e clique em <b>"+ Emitir N pendentes"</b> pra gerar as cobranças no Asaas.

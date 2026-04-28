@@ -48,14 +48,18 @@ export function calcularParcelas(valorTotal, desconto, modalidade, numParcelas) 
   return { liquido: liq, n: n, parcelas: parcelas }
 }
 
-// Registra venda completa. Se participante existe sem cliente_id, cria o cliente.
-// Atualiza programa, stage='Ganho', participante.comprou=true.
-// Retorna { financeiro_id, cliente_id }.
-export async function registrarVendaOutliers(opts) {
+// Registra venda completa de um curso/produto. Se participante existe sem
+// cliente_id, cria o cliente. Marca participante.comprou=true.
+// Atualiza programa do cliente APENAS se opts.atualizarPrograma for passado.
+// Atualiza stage='Ganho' por padrão (cliente saiu do funil).
+// Retorna { financeiro_id, cliente_id, parcelas }.
+export async function registrarVenda(opts) {
   var participante = opts.participante           // pode ser null se vier de outro fluxo
   var clienteIdInicial = opts.clienteId || (participante && participante.cliente_id) || null
   var eventoId = opts.eventoId || (participante && participante.evento_id) || null
   var venda = opts.venda                          // { modalidade, num_parcelas, valor_total, desconto, forma_pagamento }
+  var cursoId = opts.cursoId || null              // qual produto foi vendido (FK pra cursos)
+  var atualizarPrograma = opts.atualizarPrograma  // ex: 'Outliers' — só passa quando faz sentido renomear o programa principal do cliente
   var userId = opts.userId || null
 
   // ── 1. Garante cliente ──
@@ -68,7 +72,7 @@ export async function registrarVendaOutliers(opts) {
       cpf: participante.cpf || null,
       origem: 'Paradigma',
       status: 'Ativo',
-      programa: 'Outliers',
+      programa: atualizarPrograma || 'Outliers',
       stage: 'Ganho',
       evento_origem_id: eventoId,
       criado_por: userId,
@@ -77,25 +81,27 @@ export async function registrarVendaOutliers(opts) {
     if (errCli) throw new Error('Erro ao criar cliente: ' + errCli.message)
     clienteId = novoCli.id
   } else if (clienteId) {
-    // Cliente já existia — atualiza programa/stage pra refletir compra
-    await supabase.from('clientes').update({
-      programa: 'Outliers',
+    var updCli = {
       stage: 'Ganho',
       status: 'Ativo',
       ultimo_contato: new Date().toISOString(),
-    }).eq('id', clienteId)
+    }
+    if (atualizarPrograma) updCli.programa = atualizarPrograma
+    await supabase.from('clientes').update(updCli).eq('id', clienteId)
   }
 
   if (!clienteId) throw new Error('Não foi possível determinar o cliente da venda')
 
   // ── 2. Cria financeiro ──
-  var { data: fin, error: errFin } = await supabase.from('financeiro').insert({
+  var insertFin = {
     cliente_id: clienteId,
     modalidade: venda.modalidade,
     valor_total: Number(venda.valor_total),
     desconto: Number(venda.desconto || 0),
     forma_pagamento: venda.forma_pagamento,
-  }).select().single()
+  }
+  if (cursoId) insertFin.curso_id = cursoId
+  var { data: fin, error: errFin } = await supabase.from('financeiro').insert(insertFin).select().single()
   if (errFin) throw new Error('Erro ao criar registro financeiro: ' + errFin.message)
 
   // ── 3. Cria parcelas com vencimento mensal ──
@@ -113,3 +119,6 @@ export async function registrarVendaOutliers(opts) {
 
   return { financeiro_id: fin.id, cliente_id: clienteId, parcelas: calc.parcelas.length }
 }
+
+// Backward compat: chamadas antigas continuam funcionando
+export var registrarVendaOutliers = registrarVenda

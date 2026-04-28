@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, forwardRef, useImperativeHandle, useCallba
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../lib/AuthContext'
 import { fmt, fmtDate, C } from '../lib/ui'
-import { registrarVendaOutliers } from '../lib/vendas'
+import { registrarVenda } from '../lib/vendas'
 
 var SignaturePad = forwardRef(function(props, ref) {
   var canvasRef = useRef(null)
@@ -170,10 +170,11 @@ export default function CheckinPage() {
     if (!participante) return
     setSaving(true)
     try {
-      var resp = await registrarVendaOutliers({
+      var resp = await registrarVenda({
         participante: participante,
         eventoId: evento ? evento.id : null,
         venda: venda,
+        atualizarPrograma: 'Outliers',  // CheckinPage assume venda do programa Outliers (default)
         userId: auth.profile ? auth.profile.id : null,
       })
       setParticipante(function(p) {
