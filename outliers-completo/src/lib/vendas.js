@@ -31,8 +31,9 @@ export function calcularParcelas(valorTotal, desconto, modalidade, numParcelas) 
     var d = new Date(hoje); d.setDate(d.getDate() + 3)
     vencimentos = [isoData(d)]
   } else {
+    // Convenção: 1ª parcela é entrada (vence hoje), 2ª em +1 mês, ..., Nª em +(N-1) meses
     vencimentos = []
-    for (var i = 1; i <= n; i++) vencimentos.push(isoData(somarMeses(hoje, i)))
+    for (var i = 0; i < n; i++) vencimentos.push(isoData(somarMeses(hoje, i)))
   }
 
   var parcelas = []
