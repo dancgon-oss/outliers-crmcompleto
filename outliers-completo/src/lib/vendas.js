@@ -104,11 +104,66 @@ export async function registrarVenda(opts) {
   var { data: fin, error: errFin } = await supabase.from('financeiro').insert(insertFin).select().single()
   if (errFin) throw new Error('Erro ao criar registro financeiro: ' + errFin.message)
 
-  // ── 3. Cria parcelas com vencimento mensal ──
-  var calc = calcularParcelas(venda.valor_total, venda.desconto || 0, venda.modalidade, venda.num_parcelas)
-  var rows = calc.parcelas.map(function(p) {
-    return { financeiro_id: fin.id, numero: p.numero, valor: p.valor, vencimento: p.vencimento, status: p.status }
-  })
+  // ── 3. Cria parcelas (com suporte a entrada separada) ──
+  // Se venda.entrada_valor > 0, cria parcela #1 = entrada (com forma e status próprios)
+  // e o restante (líquido - entrada) distribuído em N parcelas (forma da venda).
+  var liq = Number(venda.valor_total) - Number(venda.desconto || 0)
+  var entradaValor = Number(venda.entrada_valor || 0)
+  var entradaForma = venda.entrada_forma || null
+  var entradaPaga = !!venda.entrada_paga
+  var formaParcelas = venda.forma_pagamento_parcelas || venda.forma_pagamento || null
+
+  var rows = []
+  var hoje = new Date(); hoje.setHours(0,0,0,0)
+  var isoData = function(d){ return d.toISOString().slice(0,10) }
+  var somarMeses = function(base, m) {
+    var d = new Date(base.getTime())
+    var diaAlvo = d.getDate()
+    d.setDate(1); d.setMonth(d.getMonth() + m)
+    var ult = new Date(d.getFullYear(), d.getMonth()+1, 0).getDate()
+    d.setDate(Math.min(diaAlvo, ult))
+    return d
+  }
+
+  if (entradaValor > 0) {
+    rows.push({
+      financeiro_id: fin.id,
+      numero: 1,
+      valor: Number(entradaValor.toFixed(2)),
+      vencimento: isoData(hoje),
+      status: entradaPaga ? 'Pago' : 'Pendente',
+      pago_em: entradaPaga ? isoData(hoje) : null,
+      forma_pagamento: entradaForma,
+    })
+    var restante = liq - entradaValor
+    var nParc = (venda.modalidade === 'A Vista') ? 0 : Number(venda.num_parcelas || 0)
+    if (nParc > 0 && restante > 0.005) {
+      var centavos = Math.round(restante * 100)
+      var unit = Math.floor(centavos / nParc) / 100
+      var ultima = (centavos - Math.floor(centavos / nParc) * (nParc - 1)) / 100
+      for (var i = 0; i < nParc; i++) {
+        rows.push({
+          financeiro_id: fin.id,
+          numero: i + 2,
+          valor: i === nParc - 1 ? ultima : unit,
+          vencimento: isoData(somarMeses(hoje, i + 1)),
+          status: 'Pendente',
+          pago_em: null,
+          forma_pagamento: formaParcelas,
+        })
+      }
+    }
+  } else {
+    // Sem entrada explicita → comportamento antigo
+    var calc = calcularParcelas(venda.valor_total, venda.desconto || 0, venda.modalidade, venda.num_parcelas)
+    rows = calc.parcelas.map(function(p) {
+      return {
+        financeiro_id: fin.id, numero: p.numero, valor: p.valor,
+        vencimento: p.vencimento, status: p.status,
+        forma_pagamento: formaParcelas,
+      }
+    })
+  }
   var { error: errParc } = await supabase.from('parcelas').insert(rows)
   if (errParc) throw new Error('Erro ao criar parcelas: ' + errParc.message)
 
@@ -117,7 +172,13 @@ export async function registrarVenda(opts) {
     await supabase.from('participantes').update({ cliente_id: clienteId, comprou: true }).eq('id', participante.id)
   }
 
-  return { financeiro_id: fin.id, cliente_id: clienteId, parcelas: calc.parcelas.length }
+  // ── 5. Gera comissões automaticamente conforme regras ativas do curso ──
+  // Usa RPC do banco (encapsula toda a lógica e schema da tabela comissoes)
+  try {
+    await supabase.rpc('aplicar_regras_comissao', { p_fin_id: fin.id })
+  } catch (e) { /* nao bloqueia a venda */ }
+
+  return { financeiro_id: fin.id, cliente_id: clienteId, parcelas: rows.length }
 }
 
 // Backward compat: chamadas antigas continuam funcionando

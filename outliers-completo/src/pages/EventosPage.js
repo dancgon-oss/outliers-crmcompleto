@@ -1,11 +1,12 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../lib/AuthContext'
-import { fmtDate, fmt, C } from '../lib/ui'
+import { fmtDate, fmt, formatTel, unformatTel, C } from '../lib/ui'
 import { registrarVenda } from '../lib/vendas'
 import QRCode from 'qrcode'
 
-export default function EventosPage() {
+export default function EventosPage(props) {
+  var onNavigate = props && props.onNavigate
   var auth = useAuth()
   var [eventos, setEventos] = useState([])
   var [selected, setSelected] = useState(null)
@@ -20,7 +21,13 @@ export default function EventosPage() {
   var [sendResult, setSendResult] = useState(null)
   // Venda — abre modal com formulário pré-preenchido
   var [vendaPart, setVendaPart] = useState(null)
-  var [vendaForm, setVendaForm] = useState({ curso_id: '', modalidade: 'Parcelado', num_parcelas: 6, valor_total: 0, desconto: 0, forma_pagamento: 'Asaas' })
+  var [vendaForm, setVendaForm] = useState({
+    curso_id: '', modalidade: 'Parcelado', num_parcelas: 6,
+    valor_total: 0, desconto: 0,
+    forma_pagamento: 'Asaas',                  // forma "principal" (compatibilidade)
+    forma_pagamento_parcelas: 'Boleto',        // forma das parcelas (restante)
+    entrada_valor: 0, entrada_forma: 'PIX', entrada_paga: true,
+  })
   var [vendaErr, setVendaErr] = useState('')
   var [vendaOk, setVendaOk] = useState(null)
   var [cursos, setCursos] = useState([])
@@ -69,14 +76,58 @@ export default function EventosPage() {
     setSaving(false)
   }
 
+  function normTel(s) { return (s || '').replace(/\D/g, '') }
+  function normNome(s) { return (s || '').trim().toLowerCase() }
+
   async function salvarParticipante() {
     if (!novoPart.nome || !novoPart.telefone || !selected) return
     setSaving(true)
-    await supabase.from('participantes').insert({ ...novoPart, evento_id: selected.id })
+    var nomeN = normNome(novoPart.nome)
+    var telN = normTel(novoPart.telefone)
+    var dup = participantes.find(function(p){ return normNome(p.nome) === nomeN || (telN && normTel(p.telefone) === telN) })
+    if (dup) {
+      alert('Ja existe um participante com este nome ou telefone neste evento: ' + dup.nome + ' (' + dup.telefone + ').')
+      setSaving(false)
+      return
+    }
+    await supabase.from('participantes').insert({ ...novoPart, telefone: unformatTel(novoPart.telefone) || null, evento_id: selected.id })
     await fetchParticipantes(selected.id)
     setShowNovoPart(false)
     setNovoPart({ nome:'',email:'',telefone:'',cpf:'' })
     setSaving(false)
+  }
+
+  async function chamarExclusao(payload) {
+    var session = (await supabase.auth.getSession()).data.session
+    var token = session ? session.access_token : null
+    var resp = await fetch('/api/excluir-participantes', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify(payload),
+    })
+    var data = await resp.json().catch(function(){ return {} })
+    return { ok: resp.ok, data: data }
+  }
+
+  async function excluirParticipante(p) {
+    if (!p || !p.id) return
+    if (!window.confirm('Excluir o participante "' + p.nome + '"? Esta acao nao pode ser desfeita.')) return
+    var r = await chamarExclusao({ ids: [p.id] })
+    if (!r.ok) { alert('Erro ao excluir: ' + (r.data.error || 'desconhecido')); return }
+    if (selected) await fetchParticipantes(selected.id)
+  }
+
+  async function excluirTodosParticipantes() {
+    if (!selected) return
+    if (!participantes.length) { alert('Nenhum participante para excluir.'); return }
+    var msg = 'EXCLUIR TODOS os ' + participantes.length + ' participantes do evento "' + selected.nome + '"?\n\nEsta acao NAO pode ser desfeita.'
+    if (!window.confirm(msg)) return
+    var conf = window.prompt('Tem certeza absoluta? Digite SIM para confirmar.')
+    if (conf !== 'SIM') { alert('Cancelado.'); return }
+    var r = await chamarExclusao({ evento_id: selected.id, todos: true })
+    if (!r.ok) { alert('Erro ao excluir: ' + (r.data.error || 'desconhecido')); return }
+    alert('Excluidos: ' + (r.data.excluidos || 0))
+    await fetchParticipantes(selected.id)
   }
 
   function abrirVenda(part) {
@@ -91,6 +142,8 @@ export default function EventosPage() {
       valor_total: preco || 4800,
       desconto: 0,
       forma_pagamento: 'Asaas',
+      forma_pagamento_parcelas: 'Boleto',
+      entrada_valor: 0, entrada_forma: 'PIX', entrada_paga: true,
     })
     setVendaErr(''); setVendaOk(null)
   }
@@ -139,8 +192,9 @@ export default function EventosPage() {
   }
 
 
-  // Chama /api/enviar-qr (backend Z-API) para um batch de participantes.
-  // Trata erros de rede/auth e atualiza os participantes com qr_enviado_em.
+  // Chama /api/enviar-qr (backend Bravos) para um batch de participantes.
+  // Retorna { ..., bravosNotConfigured } quando faltam env vars do Bravos
+  // (frontend cai em fallback wa.me manual).
   async function callEnviarQrApi(ids) {
     var sess = await supabase.auth.getSession()
     var token = sess && sess.data && sess.data.session ? sess.data.session.access_token : ''
@@ -152,6 +206,9 @@ export default function EventosPage() {
         body: JSON.stringify({ participante_ids: ids }),
       })
       var data = await res.json().catch(function(){ return {} })
+      if (res.status === 503 && data && data.error === 'bravos_not_configured') {
+        return { ok: false, bravosNotConfigured: true, results: [] }
+      }
       if (!res.ok) throw new Error(data.error || data.detail || ('HTTP ' + res.status))
       return data
     } catch (e) {
@@ -159,7 +216,26 @@ export default function EventosPage() {
     }
   }
 
-  // Envia QR individual via Z-API (automatizado, sem browser redirect)
+  // Fallback manual: abre wa.me com mensagem + URL do QR pré-preenchidos.
+  function abrirWaMeManual(part) {
+    if (!part || !part.telefone) return
+    var tel = part.telefone.replace(/\D/g, '')
+    if (tel.length === 11 || tel.length === 10) tel = '55' + tel
+    var checkinUrl = window.location.origin + '/checkin/' + part.qr_token
+    var qrImg = 'https://api.qrserver.com/v1/create-qr-code/?size=500x500&margin=10&data=' + encodeURIComponent(checkinUrl)
+    var nomeEvento = selected ? selected.nome : 'evento'
+    var dataEvento = selected && selected.data_inicio ? fmtDate(selected.data_inicio) : ''
+    var local = selected && selected.local ? selected.local : ''
+    var msg = 'Olá, ' + (part.nome || '') + '!\n\n'
+      + 'Sua inscrição em *' + nomeEvento + '* está confirmada.\n'
+      + (dataEvento ? '📅 ' + dataEvento + '\n' : '')
+      + (local ? '📍 ' + local + '\n' : '')
+      + '\n🎫 *Seu QR Code de check-in:*\n' + qrImg + '\n\n'
+      + 'Apresente esta imagem na entrada. Ou use o link direto:\n' + checkinUrl + '\n\n— Equipe Outliers'
+    window.open('https://wa.me/' + tel + '?text=' + encodeURIComponent(msg), '_blank')
+  }
+
+  // Envia QR individual: tenta auto via Bravos, cai em wa.me se Bravos n configurado.
   async function enviarQRWhatsApp(part) {
     if (!part || !part.telefone) { alert('Participante sem telefone cadastrado.'); return }
     if (sending) return
@@ -167,10 +243,19 @@ export default function EventosPage() {
     var resp = await callEnviarQrApi([part.id])
     setSending(false)
     if (!resp) return
+    if (resp.bravosNotConfigured) {
+      // Fallback: abre WhatsApp Web com msg pre-preenchida pro operador clicar enviar
+      abrirWaMeManual(part)
+      setSendResult({ type: 'partial', msg: 'WhatsApp Web aberto pra envio manual (Bravos ainda não configurado).' })
+      return
+    }
     if (resp.erroGeral) { alert('Erro: ' + resp.erroGeral); return }
     var r0 = resp.results && resp.results[0]
     if (r0 && r0.ok) {
       setSendResult({ type: 'success', msg: 'QR enviado para ' + part.nome + ' via WhatsApp.' })
+      if (selected) fetchParticipantes(selected.id)
+    } else if (r0 && r0.pendente) {
+      setSendResult({ type: 'partial', msg: 'Enviado pro Bravos (timeout aguardando confirmação). Provavelmente foi entregue.' })
       if (selected) fetchParticipantes(selected.id)
     } else {
       setSendResult({ type: 'error', msg: 'Falha ao enviar para ' + part.nome + ': ' + (r0 && r0.erro || 'desconhecido') })
@@ -281,6 +366,13 @@ export default function EventosPage() {
               <div style={{ fontSize: 12, color: C.text3, marginTop: 3, fontFamily: 'monospace' }}>{fmtDate(selected.data_inicio)}{selected.local ? ' · ' + selected.local : ''}</div>
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
+              {auth.canCheckin && onNavigate && (
+                <button style={{ ...S.btnG, padding: '8px 14px', fontSize: 12, display:'flex', alignItems:'center', gap:6 }}
+                        onClick={function(){ onNavigate('checkin', { eventoId: selected.id }) }}
+                        title="Abrir tela de check-in para este evento">
+                  📍 Check-in
+                </button>
+              )}
               {auth.isAdmin && (
                 <select style={{ ...S.inp, width: 160 }} value={selected.status}
                   onChange={async function(e) {
@@ -322,14 +414,42 @@ export default function EventosPage() {
               <label style={{ ...S.btnGhost, padding: '9px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
                 📂 CSV
                 <input type="file" accept=".csv" style={{ display: 'none' }} onChange={async function(e) {
-                  var file = e.target.files[0]; if (!file || !selected) return
+                  var file = e.target.files[0]; if (!file || !selected) { e.target.value = ''; return }
                   var text = await file.text()
                   var lines = text.split('\n').filter(Boolean).slice(1)
                   var rows = lines.map(function(l) {
                     var cols = l.split(',').map(function(c){ return c.trim().replace(/^"|"$/g,'') })
                     return { nome: cols[0], email: cols[1], telefone: cols[2], cpf: cols[3], evento_id: selected.id }
                   }).filter(function(r){ return r.nome && r.telefone })
-                  if (rows.length) { await supabase.from('participantes').insert(rows); await fetchParticipantes(selected.id) }
+
+                  // Deduplicacao: contra existentes e dentro do proprio CSV
+                  var nomesExist = new Set(participantes.map(function(p){ return normNome(p.nome) }))
+                  var telsExist = new Set(participantes.map(function(p){ return normTel(p.telefone) }).filter(Boolean))
+                  var nomesNovos = new Set()
+                  var telsNovos = new Set()
+                  var inseridos = []
+                  var duplicados = []
+                  rows.forEach(function(r){
+                    var n = normNome(r.nome)
+                    var t = normTel(r.telefone)
+                    if (nomesExist.has(n) || (t && telsExist.has(t)) || nomesNovos.has(n) || (t && telsNovos.has(t))) {
+                      duplicados.push(r.nome + ' (' + r.telefone + ')')
+                    } else {
+                      inseridos.push(r)
+                      nomesNovos.add(n)
+                      if (t) telsNovos.add(t)
+                    }
+                  })
+
+                  if (inseridos.length) {
+                    var ins = await supabase.from('participantes').insert(inseridos)
+                    if (ins.error) { alert('Erro ao importar: ' + ins.error.message); e.target.value = ''; return }
+                  }
+                  await fetchParticipantes(selected.id)
+                  var msg = 'Importacao concluida.\n\n' + inseridos.length + ' inserido(s).'
+                  if (duplicados.length) msg += '\n' + duplicados.length + ' ignorado(s) por duplicidade (mesmo nome ou telefone).'
+                  alert(msg)
+                  e.target.value = ''
                 }} />
               </label>
               <button
@@ -344,6 +464,11 @@ export default function EventosPage() {
                 onClick={function(){ enviarParaTodos(participantes) }}
                 title="Reenvia para todos os participantes com telefone"
               >📱 Enviar QR (todos)</button>
+              <button
+                style={{ ...S.btnGhost, padding: '9px 14px', color:'#fca5a5', borderColor:'#7f1d1d' }}
+                onClick={excluirTodosParticipantes}
+                title="Apaga TODOS os participantes deste evento"
+              >🗑️ Excluir todos</button>
             </div>
 
             {sending && sendResult && sendResult.type === 'progress' && (
@@ -386,18 +511,18 @@ export default function EventosPage() {
             )}
 
             <div style={S.card}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 130px 110px 100px 70px 70px 90px', padding: '10px 16px', borderBottom: '1px solid ' + C.border }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 1.6fr) 150px 100px 100px 130px 70px 110px', padding: '10px 16px', borderBottom: '1px solid ' + C.border }}>
                 {['Nome','Telefone','Check-in','QR WhatsApp','Vendas','Contrato','Ações'].map(function(h,i){ return <span key={i} style={{ fontSize: 10, fontWeight: 600, color: C.text3, textTransform: 'uppercase', letterSpacing: '0.08em' }}>{h}</span> })}
               </div>
               {filtrados.length === 0 && <div style={{ padding: 30, textAlign: 'center', color: C.text3, fontSize: 13, fontStyle: 'italic' }}>Nenhum participante.</div>}
               {filtrados.map(function(p, i, arr) {
                 return (
-                  <div key={p.id} style={{ display: 'grid', gridTemplateColumns: '1fr 130px 110px 100px 70px 70px 90px', padding: '11px 16px', borderBottom: i < arr.length-1 ? '1px solid ' + C.border : 'none', alignItems: 'center', gap: 6 }}>
-                    <div>
-                      <div style={{ fontSize: 14, fontWeight: 500, color: C.text }}>{p.nome}</div>
-                      {p.email && <div style={{ fontSize: 11, color: C.text3 }}>{p.email}</div>}
+                  <div key={p.id} style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 1.6fr) 150px 100px 100px 130px 70px 110px', padding: '11px 16px', borderBottom: i < arr.length-1 ? '1px solid ' + C.border : 'none', alignItems: 'center', gap: 10 }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 14, fontWeight: 500, color: C.text, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }} title={p.nome}>{p.nome}</div>
+                      {p.email && <div style={{ fontSize: 11, color: C.text3, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }} title={p.email}>{p.email}</div>}
                     </div>
-                    <div style={{ fontSize: 12, color: C.text2, fontFamily: 'monospace' }}>{p.telefone}</div>
+                    <div style={{ fontSize: 12, color: C.text2, fontFamily: 'monospace' }}>{formatTel(p.telefone)}</div>
                     <div style={{ fontSize: 11 }}>
                       {p.checkin_at
                         ? <span style={{ color: '#4ade80', fontWeight: 600 }}>✓ {new Date(p.checkin_at).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}</span>
@@ -419,7 +544,14 @@ export default function EventosPage() {
                       </button>
                     </div>
                     <div style={{ fontSize: 11 }}>{p.comprou ? <span style={{ color: '#4ade80' }}>✓</span> : <span style={{ color: C.text3 }}>—</span>}</div>
-                    <button style={{ ...S.btnGhost, padding: '4px 10px', fontSize: 11 }} onClick={function(){ abrirQR(p) }}>QR ↗</button>
+                    <div style={{ display:'flex', gap:4 }}>
+                      <button style={{ ...S.btnGhost, padding: '4px 10px', fontSize: 11 }} onClick={function(){ abrirQR(p) }}>QR ↗</button>
+                      <button
+                        style={{ ...S.btnGhost, padding: '4px 8px', fontSize: 11, color:'#fca5a5', borderColor:'#7f1d1d' }}
+                        onClick={function(){ excluirParticipante(p) }}
+                        title="Excluir participante"
+                      >🗑️</button>
+                    </div>
                   </div>
                 )
               })}
@@ -457,7 +589,7 @@ export default function EventosPage() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
               <div><label style={S.lbl}>Nome *</label><input style={S.inp} value={novoPart.nome} onChange={function(e){setNovoPart(function(p){return {...p,nome:e.target.value}})}} /></div>
               <div style={{ display:'flex', gap:12 }}>
-                <div style={{ flex:1 }}><label style={S.lbl}>Telefone *</label><input style={S.inp} value={novoPart.telefone} onChange={function(e){setNovoPart(function(p){return {...p,telefone:e.target.value}})}} /></div>
+                <div style={{ flex:1 }}><label style={S.lbl}>Telefone *</label><input style={S.inp} value={novoPart.telefone} onChange={function(e){setNovoPart(function(p){return {...p,telefone:e.target.value}})}} placeholder="(11) 98765-4321" /></div>
                 <div style={{ flex:1 }}><label style={S.lbl}>CPF</label><input style={S.inp} value={novoPart.cpf} onChange={function(e){setNovoPart(function(p){return {...p,cpf:e.target.value}})}} /></div>
               </div>
               <div><label style={S.lbl}>E-mail</label><input style={S.inp} type="email" value={novoPart.email} onChange={function(e){setNovoPart(function(p){return {...p,email:e.target.value}})}} /></div>
@@ -496,20 +628,6 @@ export default function EventosPage() {
                 </div>
                 <div style={{ display: 'flex', gap: 12 }}>
                   <div style={{ flex: 1 }}>
-                    <label style={S.lbl}>Modalidade</label>
-                    <select style={S.inp} value={vendaForm.modalidade} onChange={function(e){ setVendaForm(function(p){ return { ...p, modalidade: e.target.value } }) }}>
-                      <option>Parcelado</option><option>A Vista</option>
-                    </select>
-                  </div>
-                  <div style={{ flex: 1 }}>
-                    <label style={S.lbl}>Forma de pagamento</label>
-                    <select style={S.inp} value={vendaForm.forma_pagamento} onChange={function(e){ setVendaForm(function(p){ return { ...p, forma_pagamento: e.target.value } }) }}>
-                      <option>Asaas</option><option>PIX</option><option>Cartão</option><option>Boleto</option>
-                    </select>
-                  </div>
-                </div>
-                <div style={{ display: 'flex', gap: 12 }}>
-                  <div style={{ flex: 1 }}>
                     <label style={S.lbl}>Valor total (R$)</label>
                     <input style={S.inp} type="number" step="0.01" value={vendaForm.valor_total} onChange={function(e){ setVendaForm(function(p){ return { ...p, valor_total: Number(e.target.value) } }) }} />
                   </div>
@@ -517,31 +635,92 @@ export default function EventosPage() {
                     <label style={S.lbl}>Desconto (R$)</label>
                     <input style={S.inp} type="number" step="0.01" value={vendaForm.desconto} onChange={function(e){ setVendaForm(function(p){ return { ...p, desconto: Number(e.target.value) } }) }} />
                   </div>
-                </div>
-                {vendaForm.modalidade === 'Parcelado' && (
-                  <div style={{ width: '50%' }}>
-                    <label style={S.lbl}>Número de parcelas</label>
-                    <select style={S.inp} value={vendaForm.num_parcelas} onChange={function(e){ setVendaForm(function(p){ return { ...p, num_parcelas: Number(e.target.value) } }) }}>
-                      {[2,3,4,5,6,7,8,9,10,11,12].map(function(n){ return <option key={n} value={n}>{n}x</option> })}
+                  <div style={{ flex: 1 }}>
+                    <label style={S.lbl}>Modalidade</label>
+                    <select style={S.inp} value={vendaForm.modalidade} onChange={function(e){ setVendaForm(function(p){ return { ...p, modalidade: e.target.value } }) }}>
+                      <option>Parcelado</option><option>A Vista</option>
                     </select>
                   </div>
-                )}
-                {/* Resumo */}
-                <div style={{ background: C.bgHover, border: '1px solid ' + C.border, borderRadius: 8, padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <div>
-                    <div style={{ fontSize: 11, color: C.text3, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Valor líquido</div>
-                    <div style={{ fontSize: 22, fontWeight: 700, color: C.gold }}>{fmt(vendaForm.valor_total - vendaForm.desconto)}</div>
-                  </div>
-                  {vendaForm.modalidade === 'Parcelado' && vendaForm.num_parcelas > 0 && (
-                    <div style={{ textAlign: 'right' }}>
-                      <div style={{ fontSize: 11, color: C.text3 }}>{vendaForm.num_parcelas}x mensais de</div>
-                      <div style={{ fontSize: 16, fontWeight: 600, color: C.text }}>{fmt((vendaForm.valor_total - vendaForm.desconto) / vendaForm.num_parcelas)}</div>
-                    </div>
-                  )}
                 </div>
+
+                {/* ENTRADA */}
+                <div style={{ background: C.bg, border: '1px solid ' + C.border, borderRadius: 8, padding: '12px 14px' }}>
+                  <div style={{ fontSize: 11, color: C.gold, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 10, fontWeight: 600 }}>Entrada (opcional)</div>
+                  <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
+                    <div style={{ flex:'1 1 130px' }}>
+                      <label style={S.lbl}>Valor da entrada (R$)</label>
+                      <input style={S.inp} type="number" step="0.01" value={vendaForm.entrada_valor} onChange={function(e){ setVendaForm(function(p){ return { ...p, entrada_valor: Number(e.target.value) } }) }} placeholder="0,00" />
+                    </div>
+                    <div style={{ flex:'1 1 130px' }}>
+                      <label style={S.lbl}>Forma da entrada</label>
+                      <select style={S.inp} value={vendaForm.entrada_forma} onChange={function(e){ setVendaForm(function(p){ return { ...p, entrada_forma: e.target.value } }) }}>
+                        <option>PIX</option><option>Cartão</option><option>Boleto</option><option>Dinheiro</option><option>Transferência</option>
+                      </select>
+                    </div>
+                    <div style={{ flex:'1 1 130px', display:'flex', alignItems:'flex-end' }}>
+                      <label style={{ display:'flex', alignItems:'center', gap:6, fontSize:12, color:C.text2, padding:'10px 0' }}>
+                        <input type="checkbox" checked={vendaForm.entrada_paga} onChange={function(e){ setVendaForm(function(p){ return { ...p, entrada_paga: e.target.checked } }) }} />
+                        Entrada já recebida
+                      </label>
+                    </div>
+                  </div>
+                </div>
+
+                {/* PARCELAS DO RESTANTE */}
+                {vendaForm.modalidade === 'Parcelado' && (
+                  <div style={{ background: C.bg, border: '1px solid ' + C.border, borderRadius: 8, padding: '12px 14px' }}>
+                    <div style={{ fontSize: 11, color: C.gold, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 10, fontWeight: 600 }}>Parcelas do restante</div>
+                    <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
+                      <div style={{ flex:'1 1 120px' }}>
+                        <label style={S.lbl}>Número de parcelas</label>
+                        <select style={S.inp} value={vendaForm.num_parcelas} onChange={function(e){ setVendaForm(function(p){ return { ...p, num_parcelas: Number(e.target.value) } }) }}>
+                          {[1,2,3,4,5,6,7,8,9,10,11,12,15,18,24].map(function(n){ return <option key={n} value={n}>{n}x</option> })}
+                        </select>
+                      </div>
+                      <div style={{ flex:'1 1 130px' }}>
+                        <label style={S.lbl}>Forma das parcelas</label>
+                        <select style={S.inp} value={vendaForm.forma_pagamento_parcelas} onChange={function(e){ setVendaForm(function(p){ return { ...p, forma_pagamento_parcelas: e.target.value } }) }}>
+                          <option>Boleto</option><option>Cartão</option><option>PIX</option><option>Asaas</option><option>Transferência</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Resumo */}
+                {(function() {
+                  var liq = vendaForm.valor_total - vendaForm.desconto
+                  var ent = Number(vendaForm.entrada_valor || 0)
+                  var rest = liq - ent
+                  var nParc = vendaForm.modalidade === 'A Vista' ? 0 : Number(vendaForm.num_parcelas || 0)
+                  var unit = nParc > 0 ? rest / nParc : 0
+                  return (
+                    <div style={{ background: C.bgHover, border: '1px solid ' + C.border, borderRadius: 8, padding: '12px 16px' }}>
+                      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                        <div>
+                          <div style={{ fontSize: 11, color: C.text3, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Valor líquido</div>
+                          <div style={{ fontSize: 22, fontWeight: 700, color: C.gold }}>{fmt(liq)}</div>
+                        </div>
+                        {ent > 0 && (
+                          <div style={{ textAlign:'right' }}>
+                            <div style={{ fontSize: 11, color: C.text3 }}>Entrada {vendaForm.entrada_forma}</div>
+                            <div style={{ fontSize: 14, fontWeight: 600, color: '#4ade80' }}>{fmt(ent)}</div>
+                          </div>
+                        )}
+                        {nParc > 0 && rest > 0 && (
+                          <div style={{ textAlign:'right' }}>
+                            <div style={{ fontSize: 11, color: C.text3 }}>+ {nParc}x {vendaForm.forma_pagamento_parcelas}</div>
+                            <div style={{ fontSize: 14, fontWeight: 600, color: C.text }}>{fmt(unit)}</div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })()}
                 <div style={{ fontSize: 11, color: C.text3, lineHeight: 1.5 }}>
-                  Ao confirmar, vamos: criar/atualizar o cliente <b>{vendaPart.nome}</b> no CRM como cliente Outliers,
-                  marcar este participante como comprador, gerar registro financeiro e {vendaForm.modalidade === 'A Vista' ? '1 parcela' : vendaForm.num_parcelas + ' parcelas'} com vencimento mensal.
+                  Ao confirmar, vamos: criar/atualizar o cliente <b>{vendaPart.nome}</b> no CRM, marcar como comprador,
+                  gerar a venda{Number(vendaForm.entrada_valor) > 0 ? ' com entrada de ' + fmt(Number(vendaForm.entrada_valor)) + ' (' + vendaForm.entrada_forma + ')' : ''}
+                  {' '}{vendaForm.modalidade === 'A Vista' ? 'em parcela única' : 'e ' + vendaForm.num_parcelas + ' parcelas mensais (' + vendaForm.forma_pagamento_parcelas + ')'}.
                 </div>
               </div>
 

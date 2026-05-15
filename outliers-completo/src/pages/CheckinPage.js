@@ -53,11 +53,22 @@ function listaDiasEvento(evento) {
   return dias
 }
 
-export default function CheckinPage() {
+export default function CheckinPage(props) {
   var auth = useAuth()
+  var eventoIdInicial = props && props.eventoIdInicial
+  var onVoltar = props && props.onVoltar
   var [mode, setMode] = useState('scan')
   var [participante, setParticipante] = useState(null)
   var [evento, setEvento] = useState(null)
+  var [eventoContexto, setEventoContexto] = useState(null) // evento "fixado" via prop
+
+  // Se veio com eventoIdInicial, busca o evento e fixa como contexto
+  useEffect(function() {
+    if (!eventoIdInicial) return
+    supabase.from('eventos').select('*').eq('id', eventoIdInicial).maybeSingle().then(function(r) {
+      if (r.data) setEventoContexto(r.data)
+    })
+  }, [eventoIdInicial])
   var [checkinInfo, setCheckinInfo] = useState(null) // { dia, jaTinha, historico: [{dia, checkin_at}] }
   var [manualSearch, setManualSearch] = useState('')
   var [error, setError] = useState('')
@@ -216,9 +227,21 @@ export default function CheckinPage() {
 
       {/* Header */}
       <div style={{ borderBottom:'1px solid #2a2415',padding:'14px 22px',display:'flex',alignItems:'center',justifyContent:'space-between',background:'#0d0b06' }}>
-        <div>
-          <span style={{ fontSize:16,fontWeight:700,color:'#f0ead8' }}>Check-in</span>
-          {evento && <span style={{ marginLeft:12,fontSize:13,color:'#7a6a4a' }}>{evento.nome}</span>}
+        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+          {onVoltar && (
+            <button onClick={onVoltar}
+                    style={{ background:'#1c1810', border:'1px solid #2a2415', color:'#a08658', padding:'6px 10px', borderRadius:6, cursor:'pointer', fontSize:12, fontFamily:'Inter,sans-serif' }}
+                    title="Voltar para Eventos">← Eventos</button>
+          )}
+          <div>
+            <div style={{ fontSize:16,fontWeight:700,color:'#f0ead8' }}>Check-in</div>
+            {(eventoContexto || evento) && (
+              <div style={{ fontSize:12,color:'#c9a96e',fontWeight:500 }}>
+                {(eventoContexto || evento).nome}
+                {(eventoContexto || evento).local && <span style={{ color:'#7a6a4a', marginLeft:8 }}>· {(eventoContexto || evento).local}</span>}
+              </div>
+            )}
+          </div>
         </div>
         <div style={{ display:'flex',gap:8 }}>
           <button style={{ ...S.btnGhost,padding:'7px 14px',fontSize:12 }} onClick={function(){setMode('scan')}}>📷 Camera</button>
@@ -265,7 +288,7 @@ export default function CheckinPage() {
               {checkinInfo && checkinInfo.jaTinha ? 'Já Fez Check-in Hoje' : 'Check-in Confirmado!'}
             </div>
             <div style={{ fontSize:18,color:'#c9a96e',marginBottom:4,fontWeight:600 }}>{participante.nome}</div>
-            <div style={{ fontSize:13,color:'#7a6a4a',marginBottom:6,fontFamily:'monospace' }}>{participante.telefone}</div>
+            <div style={{ fontSize:13,color:'#7a6a4a',marginBottom:6,fontFamily:'monospace' }}>{(function(){ var d=String(participante.telefone||'').replace(/\D/g,''); if(d.length>=11)return '('+d.slice(0,2)+') '+d.slice(2,7)+'-'+d.slice(7,11); if(d.length===10)return '('+d.slice(0,2)+') '+d.slice(2,6)+'-'+d.slice(6); return participante.telefone||'' })()}</div>
             {evento && <div style={{ fontSize:13,color:'#7a6a4a',marginBottom:18 }}>📍 {evento.nome}</div>}
 
             {/* Dias do evento — mostra status de check-in em cada um */}

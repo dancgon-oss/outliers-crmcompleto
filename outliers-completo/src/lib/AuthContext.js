@@ -40,11 +40,13 @@ export function AuthProvider({ children }) {
       isFinanceiro: role === 'financeiro',
       isOperacional:role === 'operacional',
       isAluno:      role === 'aluno',
+      isStorydoing: role === 'storydoing',  // acesso restrito apenas a comissão Storydoing
+      isSolicitante:role === 'solicitante', // acesso restrito apenas a Solicitações
       isStaff:      role === 'admin' || role === 'comercial' || role === 'financeiro' || role === 'operacional',
       // Helpers de acesso
       // Financeiro: só admin e financeiro (vendedores/comercial não veem R$)
       canSeeFinanceiro: role === 'admin' || role === 'financeiro',
-      canEditClientes:  role === 'admin' || role === 'comercial' || role === 'financeiro',
+      canEditClientes:  role === 'admin' || role === 'comercial' || role === 'financeiro' || role === 'operacional',
       canDeleteClientes:role === 'admin' || role === 'comercial',
       canManageEventos: role === 'admin' || role === 'comercial',
       canManageCursos:  role === 'admin' || role === 'comercial',

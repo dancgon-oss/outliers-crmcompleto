@@ -1,11 +1,15 @@
 // supabase/functions/asaas-webhook/index.ts
 //
-// Recebe notificações do Asaas sobre mudanças em payments.
+// Recebe notificacoes do Asaas sobre mudancas em payments.
 // Requisitos atendidos:
-//   - Validação: header `asaas-access-token` obrigatório (configure no painel Asaas)
-//   - Idempotência: dedup por event.id (Asaas envia) ou tupla (event, payment.id, payment.status)
-//   - Logging: TODO webhook entra em webhook_logs, mesmo os que não encontram parcela
-//   - Sync cliente: após atualizar parcela, recalcula status do cliente (Ativo/Inadimplente)
+//   - Validacao: header `asaas-access-token` obrigatorio
+//   - Idempotencia: dedup por event.id ou tupla (event, payment.id, payment.status)
+//   - Sync cliente: Ativo/Inadimplente
+//   - LIBERACAO DE COMISSOES: quando parcela vira Pago, o trigger SQL
+//     `tg_parcela_paga_trg` cria movimentos de liberacao automaticamente
+//     E cria notificacao na tabela `notificacoes`
+//   - WHATSAPP: notifica admin via Z-API (env ADMIN_NOTIFY_PHONE,
+//     ZAPI_INSTANCE_ID, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN opcional)
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
@@ -26,10 +30,53 @@ const STATUS_MAP: Record<string, string> = {
   PAYMENT_REFUNDED: 'Pendente',
 }
 
+function fmtBRL(n: number) {
+  try { return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) } catch { return 'R$ ' + n.toFixed(2) }
+}
+
+async function notifyAdminWhatsApp(args: { clienteNome?: string; valor?: number; numero?: number | null; total?: number | null }) {
+  try {
+    const phone = (Deno.env.get('ADMIN_NOTIFY_PHONE') ?? '').replace(/\D/g, '')
+    const instance = Deno.env.get('ZAPI_INSTANCE_ID') ?? ''
+    const token = Deno.env.get('ZAPI_TOKEN') ?? ''
+    const clientToken = Deno.env.get('ZAPI_CLIENT_TOKEN') ?? ''
+    if (!phone || !instance || !token) {
+      console.log('[whatsapp] envs ausentes - notificacao pulada')
+      return
+    }
+    const valorStr = typeof args.valor === 'number' ? fmtBRL(args.valor) : ''
+    const linhaParc = args.numero
+      ? `Parcela ${args.numero}${args.total ? '/' + args.total : ''}`
+      : 'Pagamento'
+    const msg = [
+      'Outliers CRM - Pagamento recebido',
+      '',
+      'Cliente: ' + (args.clienteNome || '(sem nome)'),
+      linhaParc + (valorStr ? ' - ' + valorStr : ''),
+      '',
+      'Comissoes da parcela foram liberadas no fluxo.',
+    ].join('\n')
+
+    const url = `https://api.z-api.io/instances/${instance}/token/${token}/send-text`
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (clientToken) headers['Client-Token'] = clientToken
+    const r = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ phone, message: msg }),
+    })
+    if (!r.ok) {
+      const tx = await r.text().catch(() => '')
+      console.log('[whatsapp] falha', r.status, tx)
+    }
+  } catch (e) {
+    console.log('[whatsapp] erro', e)
+  }
+}
+
 serve(async (req) => {
   if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 })
 
-  // ── 1. Autenticação ───────────────────────────────────────────
   const expectedToken = Deno.env.get('ASAAS_WEBHOOK_TOKEN') ?? ''
   const gotToken =
     req.headers.get('asaas-access-token') ||
@@ -52,11 +99,8 @@ serve(async (req) => {
   const payment = body?.payment
   const eventId = body?.id as string | undefined
 
-  // ── 2. Log ANTES de processar (rastro completo, inclusive eventos ignorados) ──
+  // Dedup
   const dedupKey = eventId || `${event || 'UNKNOWN'}|${payment?.id || 'NOPAY'}|${payment?.status || 'NOSTATUS'}`
-
-  // Dedup via containment em JSONB: o operador @> é estável e bem indexado,
-  // diferente do path filter. Busca qualquer webhook_logs com esse _dedup_key.
   const { data: jaLogado } = await supabase
     .from('webhook_logs')
     .select('id')
@@ -69,7 +113,6 @@ serve(async (req) => {
 
   const payloadLog = { ...body, _dedup_key: dedupKey }
 
-  // Se evento não é de interesse, loga e sai
   if (!event || !EVENTOS_INTERESSE.has(event)) {
     await supabase.from('webhook_logs').insert({
       evento: event || 'UNKNOWN',
@@ -81,7 +124,6 @@ serve(async (req) => {
     return new Response(JSON.stringify({ ok: true, skipped: true, event }), { status: 200 })
   }
 
-  // ── 3. Buscar parcela pelo payment.id ──────────────────────────
   if (!payment?.id) {
     await supabase.from('webhook_logs').insert({
       evento: event, asaas_payment_id: null, parcela_id: null, status_novo: null, payload: payloadLog,
@@ -91,12 +133,11 @@ serve(async (req) => {
 
   const { data: parcela } = await supabase
     .from('parcelas')
-    .select('id, status, financeiro_id, financeiro:financeiro_id(cliente_id)')
+    .select('id, status, numero, valor, financeiro_id, financeiro:financeiro_id(cliente_id, valor_total)')
     .eq('asaas_payment_id', payment.id)
     .maybeSingle()
 
   if (!parcela) {
-    // Orfão: loga mesmo assim pra ficarmos sabendo
     await supabase.from('webhook_logs').insert({
       evento: event, asaas_payment_id: payment.id, parcela_id: null, status_novo: null, payload: payloadLog,
     })
@@ -105,7 +146,6 @@ serve(async (req) => {
 
   const novoStatus = STATUS_MAP[event]
 
-  // Se já está no status, ainda loga mas não atualiza
   if (!novoStatus || parcela.status === novoStatus) {
     await supabase.from('webhook_logs').insert({
       evento: event,
@@ -117,7 +157,6 @@ serve(async (req) => {
     return new Response(JSON.stringify({ ok: true, noChange: true }), { status: 200 })
   }
 
-  // ── 4. Atualiza parcela ───────────────────────────────────────
   const updatePayload: Record<string, unknown> = {
     status: novoStatus,
     asaas_status: payment.status,
@@ -126,11 +165,10 @@ serve(async (req) => {
   if (novoStatus === 'Pago') updatePayload.pago_em = new Date().toISOString()
   if (novoStatus === 'Pendente') updatePayload.pago_em = null
 
+  // O trigger SQL `tg_parcela_paga_trg` libera comissoes e cria notificacao.
   await supabase.from('parcelas').update(updatePayload).eq('id', parcela.id)
 
-  // ── 5. Sincroniza status do cliente ───────────────────────────
-  // Regra: qualquer parcela Atrasada → cliente Inadimplente.
-  //        Caso contrário, se estava Inadimplente → volta pra Ativo.
+  // Sync cliente Ativo/Inadimplente
   const clienteId = (parcela as any)?.financeiro?.cliente_id
   if (clienteId) {
     const { data: todasParcelas } = await supabase
@@ -142,7 +180,7 @@ serve(async (req) => {
 
     const { data: cliente } = await supabase
       .from('clientes')
-      .select('status')
+      .select('status, nome')
       .eq('id', clienteId)
       .maybeSingle()
 
@@ -153,9 +191,22 @@ serve(async (req) => {
         await supabase.from('clientes').update({ status: 'Ativo' }).eq('id', clienteId)
       }
     }
+
+    // WhatsApp pro admin so quando virou Pago
+    if (novoStatus === 'Pago') {
+      const { count: totalParcelas } = await supabase
+        .from('parcelas')
+        .select('id', { count: 'exact', head: true })
+        .eq('financeiro_id', parcela.financeiro_id)
+      await notifyAdminWhatsApp({
+        clienteNome: cliente?.nome,
+        valor: Number(parcela.valor),
+        numero: (parcela as any).numero,
+        total: totalParcelas ?? null,
+      })
+    }
   }
 
-  // ── 6. Log final ──────────────────────────────────────────────
   await supabase.from('webhook_logs').insert({
     evento: event,
     asaas_payment_id: payment.id,

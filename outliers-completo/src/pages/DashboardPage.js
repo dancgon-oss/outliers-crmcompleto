@@ -19,7 +19,7 @@ function StatCard({ label, value, sub, color, icon }) {
 export default function DashboardPage({ onNav }) {
   var auth = useAuth()
   var verFin = auth.canSeeFinanceiro    // admin + financeiro só
-  var [stats, setStats] = useState({ clientes: 0, ativos: 0, inad: 0, recebido: 0, pendente: 0, atrasado: 0 })
+  var [stats, setStats] = useState({ clientes: 0, ativos: 0, inad: 0, recebido: 0, pendente: 0, atrasado: 0, comissaoPagar: 0, comissaoPagaMes: 0, comissaoTotalLiberada: 0 })
   var [alertas, setAlertas] = useState([])
   var [receitaMensal, setReceitaMensal] = useState([])
   var [loading, setLoading] = useState(true)
@@ -29,14 +29,18 @@ export default function DashboardPage({ onNav }) {
   async function carregar() {
     setLoading(true)
     try {
-      var [rc, rp, rf] = await Promise.all([
+      var [rc, rp, rf, rcom, rmov] = await Promise.all([
         supabase.from('clientes').select('id,status,created_at'),
         supabase.from('parcelas').select('id,valor,status,vencimento,financeiro_id'),
         supabase.from('financeiro').select('id,cliente_id'),
+        supabase.from('comissoes').select('id,valor_total,valor_liberado,valor_pago,status'),
+        supabase.from('comissao_movimentos').select('valor,tipo,created_at'),
       ])
 
       var clientes = rc.data || []
       var parcelas = rp.data || []
+      var comissoes = rcom.data || []
+      var movs = rmov.data || []
 
       var ativos = clientes.filter(function(c){ return c.status === 'Ativo' }).length
       var inad   = clientes.filter(function(c){ return c.status === 'Inadimplente' }).length
@@ -44,7 +48,18 @@ export default function DashboardPage({ onNav }) {
       var pendente = parcelas.filter(function(p){ return p.status === 'Pendente' }).reduce(function(s,p){ return s + Number(p.valor) }, 0)
       var atrasado = parcelas.filter(function(p){ return p.status === 'Atrasado' }).reduce(function(s,p){ return s + Number(p.valor) }, 0)
 
-      setStats({ clientes: clientes.length, ativos: ativos, inad: inad, recebido: recebido, pendente: pendente, atrasado: atrasado })
+      // Comissões
+      var totalLiberada = comissoes.reduce(function(s,c){ return s + Number(c.valor_liberado||0) }, 0)
+      var totalPaga = comissoes.reduce(function(s,c){ return s + Number(c.valor_pago||0) }, 0)
+      var comissaoPagar = totalLiberada - totalPaga
+      var hojeRef = new Date()
+      var comissaoPagaMes = movs.filter(function(m){
+        if (m.tipo !== 'pagamento' || !m.created_at) return false
+        var d = new Date(m.created_at)
+        return d.getFullYear() === hojeRef.getFullYear() && d.getMonth() === hojeRef.getMonth()
+      }).reduce(function(s,m){ return s + Number(m.valor) }, 0)
+
+      setStats({ clientes: clientes.length, ativos: ativos, inad: inad, recebido: recebido, pendente: pendente, atrasado: atrasado, comissaoPagar: comissaoPagar, comissaoPagaMes: comissaoPagaMes, comissaoTotalLiberada: totalLiberada })
 
       // Alertas: parcelas vencendo em até 5 dias ou atrasadas
       var alertasList = []
@@ -105,6 +120,15 @@ export default function DashboardPage({ onNav }) {
             <StatCard label="Em Atraso"       value={fmt(stats.atrasado)}  sub="parcelas atrasadas"            icon="🔴" color={stats.atrasado > 0 ? C.red : C.text} />
           </>}
         </div>
+
+        {/* Comissões */}
+        {verFin && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 16, marginBottom: 28 }}>
+            <StatCard label="Comissões a pagar"  value={fmt(stats.comissaoPagar)} sub="liberadas, ainda não pagas"  icon="🤝" color={stats.comissaoPagar > 0 ? C.gold : C.text} />
+            <StatCard label="Comissões pagas no mês" value={fmt(stats.comissaoPagaMes)} sub="já transferidas neste mês" icon="📤" color="#4ade80" />
+            <StatCard label="Total liberado"     value={fmt(stats.comissaoTotalLiberada)} sub="já gerado por parcelas pagas" icon="📊" />
+          </div>
+        )}
 
         {/* Charts + Alertas (financeiros — só pra quem pode ver R$) */}
         {verFin && (

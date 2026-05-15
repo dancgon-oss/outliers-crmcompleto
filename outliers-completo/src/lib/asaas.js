@@ -4,9 +4,26 @@ async function asaasRequest(method, path, body) {
   var payload = { method: method, path: path }
   if (body) payload.body = body
   var result = await supabase.functions.invoke('asaas-proxy', { body: payload })
-  if (result.error) throw new Error(result.error.message)
+  // Trata erro de Edge Function — extrai mensagem real do Asaas
+  if (result.error) {
+    var msg = result.error.message || 'Falha na chamada Asaas'
+    try {
+      // Quando há non-2xx, o context do erro tem o body com os erros do Asaas
+      if (result.error.context && typeof result.error.context.json === 'function') {
+        var ctxData = await result.error.context.json()
+        if (ctxData && ctxData.errors && ctxData.errors.length > 0) {
+          msg = ctxData.errors.map(function(e){ return e.description || e.code }).join(' | ')
+        } else if (ctxData && ctxData.error) {
+          msg = ctxData.error
+        }
+      }
+    } catch (_e) {}
+    throw new Error('Asaas: ' + msg)
+  }
   var data = result.data
-  if (data && data.errors && data.errors.length > 0) throw new Error(data.errors[0].description || 'Erro Asaas')
+  if (data && data.errors && data.errors.length > 0) {
+    throw new Error('Asaas: ' + data.errors.map(function(e){ return e.description || e.code }).join(' | '))
+  }
   return data
 }
 

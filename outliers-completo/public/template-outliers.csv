@@ -1,0 +1,5 @@
+nome;email;telefone;cpf;curso;valor_total;desconto;entrada_valor;entrada_forma;entrada_data;entrada_paga;bloco1_valor;bloco1_parcelas;bloco1_forma;bloco1_primeira_data;bloco2_valor;bloco2_parcelas;bloco2_forma;bloco2_primeira_data;parcelas_pagas;datas_pagamento;programa;edicao;origem;observacoes
+Daniel da Costa Goncalves;daniel@email.com;21987298499;;Outliers;30000,00;0;5000,00;PIX;2026-04-28;Sim;25000,00;5;Boleto;2026-05-28;;;;;;Outliers;39;Paradigma;Entrada PIX + 5x boleto
+Miguel Goncalves;miguel@email.com;21999998888;;Outliers;15000,00;0;3000,00;PIX;2026-05-10;Sim;6000,00;6;Cartao;2026-06-10;6000,00;6;Boleto;2026-06-10;;;Outliers;39;Paradigma;Entrada + metade cartao metade boleto
+Ana Paula Silva;ana@email.com;11988887777;;Paradigma;1500,00;0;1500,00;PIX;2026-05-15;Sim;;;;;;;;;;Paradigma;Q2;Instagram;Pagamento a vista no PIX
+Carla Souza;carla@email.com;11977776666;;Outliers;20000,00;2000;;;;;18000,00;12;Cartao;2026-05-15;;;;;1,2;2026-05-15,2026-06-15;Outliers;39;Indicacao;Sem entrada — 12x cartao

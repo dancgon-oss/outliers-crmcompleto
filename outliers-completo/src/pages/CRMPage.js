@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../lib/AuthContext'
-import { fmt, fmtDate, C, STATUS_C } from '../lib/ui'
+import { fmt, fmtDate, formatTel, unformatTel, formatCPF, unformatCPF, C, STATUS_C } from '../lib/ui'
+import { importarPlanilhaOutliers } from '../lib/importarOutliers'
 
 function Badge({ label, colors }) {
   return <span style={{ background:colors.bg+'33',color:colors.text,border:'1px solid '+colors.bg,padding:'3px 10px',borderRadius:20,fontSize:11,fontWeight:600,whiteSpace:'nowrap' }}>{label}</span>
@@ -25,6 +26,9 @@ export default function CRMPage() {
   var [newClient, setNewClient] = useState(emptyClient())
   var [saving, setSaving] = useState(false)
   var [presencas, setPresencas] = useState([])
+  var [editing, setEditing] = useState(false)
+  var [editForm, setEditForm] = useState(null)
+  var [savingEdit, setSavingEdit] = useState(false)
 
   var fetchClients = useCallback(async function() {
     setLoading(true)
@@ -60,7 +64,8 @@ export default function CRMPage() {
   async function saveNew() {
     if (!newClient.nome.trim()) return
     setSaving(true)
-    await supabase.from('clientes').insert({ ...newClient, criado_por: auth.profile?auth.profile.id:null })
+    var payload = { ...newClient, telefone: unformatTel(newClient.telefone) || null, cpf: unformatCPF(newClient.cpf) || null, criado_por: auth.profile?auth.profile.id:null }
+    await supabase.from('clientes').insert(payload)
     await fetchClients()
     setShowNew(false); setNewClient(emptyClient())
     setSaving(false)
@@ -90,7 +95,48 @@ export default function CRMPage() {
               </div>
             )
           })}
-          <div style={{ display:'flex',alignItems:'center',padding:'0 12px',background:'#0d0b06' }}>
+          <div style={{ display:'flex',alignItems:'center',gap:6,padding:'0 12px',background:'#0d0b06' }}>
+            {auth.canEditClientes && (
+              <button style={{ background:'#1c1810',border:'1px solid #2a2415',color:'#a08658',padding:'7px 11px',borderRadius:6,fontSize:11,cursor:'pointer',fontFamily:'Inter,sans-serif' }}
+                      title="Recalcula o status (Ativo/Inadimplente) de todos os clientes baseado nas parcelas atuais"
+                      onClick={async function() {
+                        if (!window.confirm('Recalcular status de todos os clientes?\n\nClientes sem parcela atrasada voltam para "Ativo".')) return
+                        var r = await supabase.rpc('recalcular_status_todos_clientes')
+                        if (r.error) { alert('Erro: ' + r.error.message); return }
+                        var d = r.data || {}
+                        alert('Recalculado!\n\n• Processados: ' + (d.clientes_processados||0)
+                          + '\n• Voltaram para Ativo: ' + (d.inadimplente_para_ativo||0)
+                          + '\n• Marcados Inadimplente: ' + (d.ativo_para_inadimplente||0))
+                        if (typeof window !== 'undefined') window.location.reload()
+                      }}>🔄 Recalcular</button>
+            )}
+            {auth.canEditClientes && (
+              <label style={{ background:'#1c1810',border:'1px solid #2a2415',color:'#a08658',padding:'7px 11px',borderRadius:6,fontSize:11,cursor:'pointer',fontFamily:'Inter,sans-serif',display:'flex',alignItems:'center',gap:4 }}
+                     title="Importar planilha CSV de clientes Outliers (com vendas e parcelas)">
+                📂 Importar
+                <input type="file" accept=".csv,text/csv" style={{ display:'none' }} onChange={async function(e) {
+                  var file = e.target.files[0]; e.target.value = ''
+                  if (!file) return
+                  if (!window.confirm('Importar planilha "' + file.name + '"?\n\nFormato esperado: CSV (separador ; ou ,) com colunas:\nnome; email; telefone; cpf; curso; valor_total; desconto; modalidade; num_parcelas; data_primeira_parcela; parcelas_pagas; datas_pagamento; programa; edicao; origem; observacoes\n\nBaixe o template em /template-outliers.csv se precisar.')) return
+                  var text = await file.text()
+                  var res = await importarPlanilhaOutliers(text, { userId: auth.profile && auth.profile.id })
+                  if (!res.ok) { alert('Erro: ' + res.error); return }
+                  var msg = 'Importação concluída!\n\n✓ ' + res.criados + ' cliente(s) criado(s) com vendas e parcelas.\n'
+                  if (res.erros && res.erros.length) {
+                    msg += '\n⚠️ ' + res.erros.length + ' linha(s) com erro:\n'
+                    res.erros.slice(0,10).forEach(function(er){ msg += '  • Linha ' + er.linha + ': ' + er.motivo + '\n' })
+                    if (res.erros.length > 10) msg += '  • ...e mais ' + (res.erros.length - 10) + '\n'
+                  }
+                  alert(msg)
+                  fetchClients()
+                }} />
+              </label>
+            )}
+            {auth.canEditClientes && (
+              <a href="/template-outliers.csv" download
+                 style={{ background:'transparent', color:'#7a6a4a', padding:'7px 6px', fontSize:10, textDecoration:'underline', fontFamily:'Inter,sans-serif' }}
+                 title="Baixar template CSV">template</a>
+            )}
             {auth.canEditClientes && <button style={S.btnG} onClick={function(){setShowNew(true)}}>+ Novo</button>}
           </div>
         </div>
@@ -118,7 +164,7 @@ export default function CRMPage() {
                   <div style={{ fontSize:14,fontWeight:600,color:'#f0ead8' }}>{c.nome}</div>
                   <Badge label={c.status} colors={sc} />
                 </div>
-                <div style={{ fontSize:11,color:'#7a6a4a' }}>{c.email||c.telefone||'--'}</div>
+                <div style={{ fontSize:11,color:'#7a6a4a' }}>{c.email || formatTel(c.telefone) || '--'}</div>
                 <div style={{ fontSize:11,color:'#7a6a4a',marginTop:2 }}>{c.origem}{c.edicao?' · '+c.edicao:''}</div>
               </div>
             )
@@ -132,7 +178,7 @@ export default function CRMPage() {
           <div style={{ padding:'18px 24px',borderBottom:'1px solid #2a2415',background:'#0d0b06',display:'flex',justifyContent:'space-between',alignItems:'flex-start' }}>
             <div>
               <div style={{ fontSize:22,fontWeight:700,color:'#f0ead8',letterSpacing:'-0.01em',marginBottom:4 }}>{selected.nome}</div>
-              <div style={{ fontSize:12,color:'#7a6a4a' }}>{selected.email} {selected.email&&selected.telefone?'·':''} {selected.telefone}</div>
+              <div style={{ fontSize:12,color:'#7a6a4a' }}>{selected.email} {selected.email&&selected.telefone?'·':''} {formatTel(selected.telefone)}</div>
             </div>
             <div style={{ display:'flex',gap:8 }}>
               {auth.canEditClientes && (
@@ -145,6 +191,20 @@ export default function CRMPage() {
                   }}>
                   {['Ativo','Inadimplente','Concluido','Inativo'].map(function(s){return <option key={s}>{s}</option>})}
                 </select>
+              )}
+              {auth.canDeleteClientes && (
+                <button style={{ ...S.btnGhost, color:'#fca5a5', borderColor:'#7f1d1d' }}
+                        title="Excluir cliente"
+                        onClick={async function() {
+                          if (!window.confirm('EXCLUIR o cliente "' + selected.nome + '"?\n\nIsso apaga TUDO relacionado: vendas, parcelas, comissões, contratos, histórico.\n\nNão pode ser desfeito.')) return
+                          var conf = window.prompt('Tem certeza absoluta? Digite EXCLUIR para confirmar.')
+                          if (conf !== 'EXCLUIR') { alert('Cancelado.'); return }
+                          var r = await supabase.rpc('excluir_cliente', { p_cli_id: selected.id })
+                          if (r.error) { alert('Erro: ' + r.error.message); return }
+                          if (!r.data || !r.data.ok) { alert('Erro: ' + ((r.data && r.data.error) || 'desconhecido')); return }
+                          setSelected(null)
+                          fetchClients()
+                        }}>🗑️ Excluir</button>
               )}
               <button style={S.btnGhost} onClick={function(){setSelected(null)}}>✕</button>
             </div>
@@ -166,25 +226,122 @@ export default function CRMPage() {
 
             {/* TAB DADOS */}
             {tab==='dados' && (
-              <div style={{ display:'grid',gridTemplateColumns:'1fr 1fr',gap:14 }}>
-                {[
-                  {l:'Status',v:selected.status},
-                  {l:'Programa',v:selected.programa||'--'},
-                  {l:'Edicao',v:selected.edicao||'--'},
-                  {l:'Entrada',v:fmtDate(selected.data_entrada)},
-                  {l:'Origem',v:selected.origem||'--'},
-                  {l:'CPF',v:selected.cpf||'--'},
-                  {l:'Telefone',v:selected.telefone||'--'},
-                  {l:'E-mail',v:selected.email||'--'},
-                ].map(function(f,i) {
-                  return (
-                    <div key={i} style={{ ...S.card,padding:'12px 16px' }}>
-                      <div style={S.lbl}>{f.l}</div>
-                      <div style={{ fontSize:14,color:'#f0ead8',fontWeight:500 }}>{f.v}</div>
+              <div>
+                {auth.canEditClientes && !editing && (
+                  <div style={{ display:'flex', justifyContent:'flex-end', marginBottom:12 }}>
+                    <button style={S.btnGhost} onClick={function(){
+                      setEditForm({
+                        nome: selected.nome || '',
+                        email: selected.email || '',
+                        telefone: selected.telefone || '',
+                        cpf: selected.cpf || '',
+                        programa: selected.programa || '',
+                        edicao: selected.edicao || '',
+                        origem: selected.origem || '',
+                        data_entrada: selected.data_entrada ? String(selected.data_entrada).slice(0,10) : '',
+                        observacoes: selected.observacoes || '',
+                      })
+                      setEditing(true)
+                    }}>✎ Editar</button>
+                  </div>
+                )}
+
+                {!editing && (
+                  <div style={{ display:'grid',gridTemplateColumns:'1fr 1fr',gap:14 }}>
+                    {[
+                      {l:'Nome',     v:selected.nome},
+                      {l:'E-mail',   v:selected.email},
+                      {l:'Telefone', v:formatTel(selected.telefone)},
+                      {l:'CPF',      v:formatCPF(selected.cpf)},
+                      {l:'Programa', v:selected.programa},
+                      {l:'Edição',   v:selected.edicao},
+                      {l:'Origem',   v:selected.origem},
+                      {l:'Entrada',  v:selected.data_entrada ? fmtDate(selected.data_entrada) : null},
+                    ].map(function(f,i) {
+                      return (
+                        <div key={i} style={{ ...S.card,padding:'12px 16px' }}>
+                          <div style={S.lbl}>{f.l}</div>
+                          <div style={{ fontSize:14,color:'#f0ead8',fontWeight:500 }}>{f.v || '--'}</div>
+                        </div>
+                      )
+                    })}
+                    <div style={{ ...S.card,padding:'12px 16px',gridColumn:'1/-1' }}>
+                      <div style={S.lbl}>Observações</div>
+                      <div style={{ fontSize:13,color:'#b8a882',fontStyle:'italic',whiteSpace:'pre-wrap' }}>{selected.observacoes || '--'}</div>
                     </div>
-                  )
-                })}
-                {selected.observacoes && <div style={{ ...S.card,padding:'12px 16px',gridColumn:'1/-1' }}><div style={S.lbl}>Observacoes</div><div style={{ fontSize:13,color:'#b8a882',fontStyle:'italic' }}>{selected.observacoes}</div></div>}
+                  </div>
+                )}
+
+                {editing && editForm && (
+                  <div>
+                    <div style={{ display:'grid',gridTemplateColumns:'1fr 1fr',gap:14 }}>
+                      {[
+                        {k:'nome',         l:'Nome',     type:'text'},
+                        {k:'email',        l:'E-mail',   type:'email'},
+                        {k:'telefone',     l:'Telefone', type:'text'},
+                        {k:'cpf',          l:'CPF',      type:'text'},
+                        {k:'programa',     l:'Programa', type:'text'},
+                        {k:'edicao',       l:'Edição',   type:'text'},
+                        {k:'origem',       l:'Origem',   type:'text'},
+                        {k:'data_entrada', l:'Entrada',  type:'date'},
+                      ].map(function(f) {
+                        return (
+                          <div key={f.k} style={{ ...S.card,padding:'12px 16px' }}>
+                            <div style={S.lbl}>{f.l}</div>
+                            <input
+                              type={f.type}
+                              value={editForm[f.k] || ''}
+                              onChange={function(e){
+                                var v = e.target.value
+                                setEditForm(function(prev){ return { ...prev, [f.k]: v } })
+                              }}
+                              style={{ background:'#0a0900', border:'1px solid #2a2415', borderRadius:6, color:'#f0ead8', fontSize:14, padding:'8px 10px', width:'100%', outline:'none', fontFamily:'Inter,sans-serif', marginTop:4 }}
+                            />
+                          </div>
+                        )
+                      })}
+                      <div style={{ ...S.card,padding:'12px 16px',gridColumn:'1/-1' }}>
+                        <div style={S.lbl}>Observações</div>
+                        <textarea
+                          value={editForm.observacoes || ''}
+                          rows={3}
+                          onChange={function(e){
+                            var v = e.target.value
+                            setEditForm(function(prev){ return { ...prev, observacoes: v } })
+                          }}
+                          style={{ background:'#0a0900', border:'1px solid #2a2415', borderRadius:6, color:'#b8a882', fontSize:13, padding:'8px 10px', width:'100%', outline:'none', fontFamily:'Inter,sans-serif', resize:'vertical', marginTop:4 }}
+                          placeholder="Anotações sobre o cliente..."
+                        />
+                      </div>
+                    </div>
+
+                    <div style={{ display:'flex', gap:10, justifyContent:'flex-end', marginTop:16 }}>
+                      <button style={S.btnGhost} disabled={savingEdit}
+                              onClick={function(){ setEditing(false); setEditForm(null) }}>Cancelar</button>
+                      <button style={S.btnG} disabled={savingEdit}
+                              onClick={async function() {
+                                setSavingEdit(true)
+                                var patch = {
+                                  nome:         editForm.nome || null,
+                                  email:        editForm.email || null,
+                                  telefone:     unformatTel(editForm.telefone) || null,
+                                  cpf:          unformatCPF(editForm.cpf) || null,
+                                  programa:     editForm.programa || null,
+                                  edicao:       editForm.edicao || null,
+                                  origem:       editForm.origem || null,
+                                  data_entrada: editForm.data_entrada || null,
+                                  observacoes:  editForm.observacoes || null,
+                                }
+                                var r = await supabase.from('clientes').update(patch).eq('id', selected.id)
+                                setSavingEdit(false)
+                                if (r.error) { alert('Erro: ' + r.error.message); return }
+                                setClients(function(prev){ return prev.map(function(c){ return c.id===selected.id ? { ...c, ...patch } : c }) })
+                                setSelected(function(prev){ return { ...prev, ...patch } })
+                                setEditing(false); setEditForm(null)
+                              }}>{savingEdit ? 'Salvando…' : 'Salvar alterações'}</button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -336,13 +493,13 @@ export default function CRMPage() {
               <div><label style={S.lbl}>Nome *</label><input style={S.inp} value={newClient.nome} onChange={function(e){setNewClient(function(p){return {...p,nome:e.target.value}})}} /></div>
               <div style={{ display:'flex',gap:12 }}>
                 <div style={{ flex:1 }}><label style={S.lbl}>E-mail</label><input style={S.inp} type="email" value={newClient.email} onChange={function(e){setNewClient(function(p){return {...p,email:e.target.value}})}} /></div>
-                <div style={{ flex:1 }}><label style={S.lbl}>Telefone</label><input style={S.inp} value={newClient.telefone} onChange={function(e){setNewClient(function(p){return {...p,telefone:e.target.value}})}} /></div>
+                <div style={{ flex:1 }}><label style={S.lbl}>Telefone</label><input style={S.inp} value={newClient.telefone} onChange={function(e){setNewClient(function(p){return {...p,telefone:e.target.value}})}} placeholder="(11) 98765-4321" /></div>
               </div>
               <div style={{ display:'flex',gap:12 }}>
-                <div style={{ flex:1 }}><label style={S.lbl}>CPF</label><input style={S.inp} value={newClient.cpf} onChange={function(e){setNewClient(function(p){return {...p,cpf:e.target.value}})}} /></div>
+                <div style={{ flex:1 }}><label style={S.lbl}>CPF</label><input style={S.inp} value={newClient.cpf} onChange={function(e){setNewClient(function(p){return {...p,cpf:e.target.value}})}} placeholder="000.000.000-00" /></div>
                 <div style={{ flex:1 }}><label style={S.lbl}>Origem</label>
                   <select style={S.inp} value={newClient.origem} onChange={function(e){setNewClient(function(p){return {...p,origem:e.target.value}})}}>
-                    {['Paradigma','Indicacao','Renovacao','Outro'].map(function(o){return <option key={o}>{o}</option>})}
+                    {['Paradigma','Indicação','Renovação','Instagram','TikTok','YouTube','Facebook','Outro'].map(function(o){return <option key={o}>{o}</option>})}
                   </select>
                 </div>
               </div>

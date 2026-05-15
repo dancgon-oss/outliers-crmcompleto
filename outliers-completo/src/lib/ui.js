@@ -54,3 +54,48 @@ export var ASAAS_STATUS_PT = {
   OVERDUE: 'Vencido',
   REFUNDED: 'Estornado',
 }
+
+// Formata telefone para "(DDD) numero" — celular: (11) 98765-4321 / fixo: (11) 3456-7890
+export function formatTel(t) {
+  if (t == null || t === '') return ''
+  var d = String(t).replace(/\D/g, '')
+  if (!d) return ''
+  // Remove DDI 55 quando vem com prefixo (13 ou 12 digitos)
+  if (d.length === 13 && d.charAt(0) === '5' && d.charAt(1) === '5') d = d.slice(2)
+  else if (d.length === 12 && d.charAt(0) === '5' && d.charAt(1) === '5') d = d.slice(2)
+  if (d.length === 11) {
+    return '(' + d.slice(0,2) + ') ' + d.slice(2,7) + '-' + d.slice(7)
+  }
+  if (d.length === 10) {
+    return '(' + d.slice(0,2) + ') ' + d.slice(2,6) + '-' + d.slice(6)
+  }
+  if (d.length === 9) return d.slice(0,5) + '-' + d.slice(5)
+  if (d.length === 8) return d.slice(0,4) + '-' + d.slice(4)
+  return String(t)
+}
+
+// Mantem apenas digitos (uso ao salvar)
+export function unformatTel(t) {
+  if (!t) return ''
+  return String(t).replace(/\D/g, '')
+}
+
+// Formata CPF para 000.000.000-00
+export function formatCPF(c) {
+  if (c == null || c === '') return ''
+  var d = String(c).replace(/\D/g, '')
+  if (!d) return ''
+  if (d.length === 11) {
+    return d.slice(0,3) + '.' + d.slice(3,6) + '.' + d.slice(6,9) + '-' + d.slice(9)
+  }
+  // Se tem menos digitos, vai formatando o que tem
+  if (d.length > 9) return d.slice(0,3) + '.' + d.slice(3,6) + '.' + d.slice(6,9) + '-' + d.slice(9)
+  if (d.length > 6) return d.slice(0,3) + '.' + d.slice(3,6) + '.' + d.slice(6)
+  if (d.length > 3) return d.slice(0,3) + '.' + d.slice(3)
+  return d
+}
+
+export function unformatCPF(c) {
+  if (!c) return ''
+  return String(c).replace(/\D/g, '')
+}

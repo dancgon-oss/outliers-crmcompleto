@@ -93,7 +93,11 @@ async function logEnvio(participanteId, userId, status, providerId, erro, payloa
 async function enviarBravos(telefone, mensagem) {
   var base = (process.env.BRAVOS_API_URL || '').replace(/\/$/, '')
   var token = process.env.BRAVOS_API_TOKEN
-  if (!base || !token) throw new Error('BRAVOS_API_URL e BRAVOS_API_TOKEN obrigatórios')
+  if (!base || !token) {
+    var e = new Error('bravos_not_configured')
+    e.code = 'bravos_not_configured'
+    throw e
+  }
 
   // Default conservador: 9s (dá margem dentro do limite Hobby de 10s)
   var waitMs = parseInt(process.env.BRAVOS_WAIT_MS || '9000', 10)
@@ -166,6 +170,16 @@ export default async function handler(req, res) {
     if (!user) return res.status(401).json({ error: 'unauthorized' })
     var ALLOWED = ['admin', 'comercial', 'financeiro', 'operacional']
     if (ALLOWED.indexOf(user.role) < 0) return res.status(403).json({ error: 'forbidden', role: user.role })
+
+    // Cedo: se Bravos não está configurado, retorna 503 com código específico
+    // pra frontend cair em fallback (wa.me manual)
+    if (!process.env.BRAVOS_API_URL || !process.env.BRAVOS_API_TOKEN) {
+      return res.status(503).json({
+        ok: false,
+        error: 'bravos_not_configured',
+        message: 'Provedor WhatsApp (Bravos) não configurado. Use o botão "Enviar manual" como alternativa.',
+      })
+    }
 
     var body = req.body || {}
     var ids = Array.isArray(body.participante_ids) ? body.participante_ids : []

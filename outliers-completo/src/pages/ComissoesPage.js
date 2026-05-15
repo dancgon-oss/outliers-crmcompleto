@@ -77,7 +77,7 @@ var coresPapel = { comercial: C.gold, marketing: '#a78bfa', operacional: '#60a5f
 // ---------- Página principal ----------
 
 export default function ComissoesPage({ onNav, perfilUsuario, usuarioId }) {
-  var [aba, setAba] = useState('extrato')
+  var [aba, setAba] = useState('fluxo')
   var podeVerTudo = perfilUsuario === 'admin' || perfilUsuario === 'financeiro'
 
   return (
@@ -85,20 +85,221 @@ export default function ComissoesPage({ onNav, perfilUsuario, usuarioId }) {
       <div style={{ marginBottom: 24, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end' }}>
         <div>
           <div style={{ fontSize: 22, fontWeight: 700, color: C.text, letterSpacing: '-0.02em' }}>Comissões</div>
-          <div style={{ fontSize: 13, color: C.text3, marginTop: 4 }}>Regras flexíveis por curso, beneficiário e campanha</div>
+          <div style={{ fontSize: 13, color: C.text3, marginTop: 4 }}>Fluxo, regras e campanhas — liberação automática conforme cliente paga</div>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
+          <Tab ativo={aba==='fluxo'} onClick={function(){ setAba('fluxo') }}>Fluxo</Tab>
           <Tab ativo={aba==='extrato'} onClick={function(){ setAba('extrato') }}>Extrato</Tab>
           {podeVerTudo && <Tab ativo={aba==='regras'} onClick={function(){ setAba('regras') }}>Regras</Tab>}
           {podeVerTudo && <Tab ativo={aba==='campanhas'} onClick={function(){ setAba('campanhas') }}>Campanhas</Tab>}
         </div>
       </div>
 
+      {aba === 'fluxo'     && <Fluxo podeVerTudo={podeVerTudo} usuarioId={usuarioId} />}
       {aba === 'extrato'   && <Extrato podeVerTudo={podeVerTudo} usuarioId={usuarioId} />}
       {aba === 'regras'    && podeVerTudo && <Regras />}
       {aba === 'campanhas' && podeVerTudo && <Campanhas />}
     </div>
   )
+}
+
+// ---------- ABA: Fluxo (uma linha por parcela do cliente x beneficiario) ----------
+
+function Fluxo({ podeVerTudo, usuarioId }) {
+  var [linhas, setLinhas] = useState([])
+  var [pessoas, setPessoas] = useState([])
+  var [filtroPessoa, setFiltroPessoa] = useState('')
+  var [filtroStatus, setFiltroStatus] = useState('')
+  var [filtroMes, setFiltroMes] = useState('todos')   // todos | atual | proximo | passado | YYYY-MM
+  var [loading, setLoading] = useState(true)
+
+  useEffect(function() { carregar() }, [filtroPessoa, filtroStatus])
+
+  async function carregar() {
+    setLoading(true)
+    var q = supabase.from('vw_comissoes_parcelas').select('*').order('parcela_vencimento', { ascending: true })
+    if (!podeVerTudo) q = q.eq('beneficiario_id', usuarioId)
+    else if (filtroPessoa) q = q.eq('beneficiario_id', filtroPessoa)
+    if (filtroStatus) q = q.eq('comissao_parcela_status', filtroStatus)
+    var [rl, rp] = await Promise.all([
+      q,
+      supabase.from('profiles').select('id,nome,role').order('nome'),
+    ])
+    setLinhas(rl.data || [])
+    setPessoas(rp.data || [])
+    setLoading(false)
+  }
+
+  async function marcarParcelaPaga(linha) {
+    if (!podeVerTudo) return
+    if (!confirm('Marcar parcela ' + linha.parcela_numero + ' do cliente "' + linha.cliente_nome + '" como PAGA?\n\nIsso liberara comissoes proporcionalmente para todos os beneficiarios desta venda.')) return
+    var r = await supabase.from('parcelas').update({ status: 'Pago', pago_em: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', linha.parcela_id)
+    if (r.error) return alert('Erro: ' + r.error.message)
+    await carregar()
+  }
+
+  // Filtro mensal (aplicado em cima das linhas)
+  function ymOf(d) {
+    if (!d) return ''
+    try { var x = new Date(String(d).slice(0,10) + 'T00:00:00'); return x.getFullYear() + '-' + String(x.getMonth()+1).padStart(2,'0') } catch(_e) { return '' }
+  }
+  var hoje = new Date()
+  var ymAtual = hoje.getFullYear() + '-' + String(hoje.getMonth()+1).padStart(2,'0')
+  var prox = new Date(hoje.getFullYear(), hoje.getMonth()+1, 1)
+  var ymProx = prox.getFullYear() + '-' + String(prox.getMonth()+1).padStart(2,'0')
+
+  // Lista de meses únicos pra o dropdown
+  var mesesUnicos = Array.from(new Set(linhas.map(function(l){ return ymOf(l.parcela_vencimento) }).filter(Boolean))).sort()
+
+  var linhasFiltradas = linhas.filter(function(l) {
+    var ym = ymOf(l.parcela_vencimento)
+    if (filtroMes === 'todos') return true
+    if (filtroMes === 'atual') return ym === ymAtual
+    if (filtroMes === 'proximo') return ym === ymProx
+    if (filtroMes === 'passado') return ym < ymAtual
+    return ym === filtroMes  // YYYY-MM específico
+  })
+
+  // Resumo do mês atual e do próximo (independente de filtro)
+  var totalMesAtual = linhas.filter(function(l){ return ymOf(l.parcela_vencimento) === ymAtual }).reduce(function(s,l){ return s + Number(l.comissao_parcela_valor||0) }, 0)
+  var totalProxMes  = linhas.filter(function(l){ return ymOf(l.parcela_vencimento) === ymProx }).reduce(function(s,l){ return s + Number(l.comissao_parcela_valor||0) }, 0)
+
+  var totalPrevisto = linhasFiltradas.reduce(function(s,l){ return s + Number(l.comissao_parcela_valor||0) }, 0)
+  var totalLiberado = linhasFiltradas.filter(function(l){ return l.comissao_parcela_status === 'Liberada' }).reduce(function(s,l){ return s + Number(l.comissao_parcela_valor||0) }, 0)
+  var totalAtrasado = linhasFiltradas.filter(function(l){ return l.comissao_parcela_status === 'Atrasada' }).reduce(function(s,l){ return s + Number(l.comissao_parcela_valor||0) }, 0)
+  var totalPrevista = linhasFiltradas.filter(function(l){ return l.comissao_parcela_status === 'Prevista' }).reduce(function(s,l){ return s + Number(l.comissao_parcela_valor||0) }, 0)
+
+  // Agrupar por beneficiario (usa as linhas FILTRADAS)
+  var porBenef = {}
+  linhasFiltradas.forEach(function(l) {
+    var k = l.beneficiario_id + '|' + (l.beneficiario_nome || '')
+    if (!porBenef[k]) porBenef[k] = { id: l.beneficiario_id, nome: l.beneficiario_nome || '—', papel: l.papel, total:0, liberado:0, prev:0, atras:0 }
+    porBenef[k].total += Number(l.comissao_parcela_valor||0)
+    if (l.comissao_parcela_status === 'Liberada') porBenef[k].liberado += Number(l.comissao_parcela_valor||0)
+    else if (l.comissao_parcela_status === 'Atrasada') porBenef[k].atras += Number(l.comissao_parcela_valor||0)
+    else porBenef[k].prev += Number(l.comissao_parcela_valor||0)
+  })
+  var resumoBenef = Object.values(porBenef).sort(function(a,b){ return b.total - a.total })
+
+  function fmtVenc(d) {
+    if (!d) return ''
+    try { return new Date(d).toLocaleDateString('pt-BR') } catch(_e) { return d }
+  }
+
+  return (<>
+    <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:16, marginBottom:20 }}>
+      <StatCard label="Total previsto" value={fmt(totalPrevisto)} sub="todas as parcelas" icon="📊" color={C.text} />
+      <StatCard label="Liberado" value={fmt(totalLiberado)} sub="cliente pagou" icon="✅" color="#4ade80" />
+      <StatCard label="Atrasado" value={fmt(totalAtrasado)} sub="cliente em atraso" icon="⚠️" color="#fca5a5" />
+      <StatCard label="Previsto futuro" value={fmt(totalPrevista)} sub="ainda nao venceu" icon="⏳" color={C.gold} />
+    </div>
+
+    {podeVerTudo && resumoBenef.length > 0 && (
+      <div style={{ background: C.bgCard, border:'1px solid '+C.border, borderRadius:12, marginBottom:20, padding:'14px 18px' }}>
+        <div style={{ fontSize:12, color:C.text3, textTransform:'uppercase', letterSpacing:'.08em', marginBottom:10 }}>Resumo por beneficiário</div>
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(220px,1fr))', gap:10 }}>
+          {resumoBenef.map(function(b) {
+            return (
+              <div key={b.id} style={{ background:C.bg, border:'1px solid '+C.border, borderRadius:8, padding:'10px 12px' }}>
+                <div style={{ fontSize:13, fontWeight:600, color:C.text }}>{b.nome}</div>
+                <div style={{ fontSize:11, color:C.text3, marginBottom:6 }}><Pill cor={coresPapel[b.papel]}>{b.papel}</Pill></div>
+                <div style={{ fontSize:11, color:C.text3 }}>Total: <strong style={{ color:C.text2 }}>{fmt(b.total)}</strong></div>
+                <div style={{ fontSize:11, color:'#4ade80' }}>Liberado: {fmt(b.liberado)}</div>
+                <div style={{ fontSize:11, color:C.gold }}>Previsto: {fmt(b.prev)}</div>
+                {b.atras > 0 && <div style={{ fontSize:11, color:'#fca5a5' }}>Atrasado: {fmt(b.atras)}</div>}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    )}
+
+    {/* Resumo de previsão por mês */}
+    <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:14, marginBottom:16 }}>
+      <div style={{ background:C.bgCard, border:'1px solid '+C.border, borderRadius:12, padding:'14px 18px' }}>
+        <div style={{ fontSize:11, color:C.text3, textTransform:'uppercase', letterSpacing:'.08em' }}>📅 Mês atual ({ymAtual})</div>
+        <div style={{ fontSize:22, fontWeight:700, color:C.gold, marginTop:4 }}>{fmt(totalMesAtual)}</div>
+        <div style={{ fontSize:11, color:C.text3, marginTop:2 }}>previsão de comissões com vencimento neste mês</div>
+      </div>
+      <div style={{ background:C.bgCard, border:'1px solid '+C.border, borderRadius:12, padding:'14px 18px' }}>
+        <div style={{ fontSize:11, color:C.text3, textTransform:'uppercase', letterSpacing:'.08em' }}>🗓️ Próximo mês ({ymProx})</div>
+        <div style={{ fontSize:22, fontWeight:700, color:'#a78bfa', marginTop:4 }}>{fmt(totalProxMes)}</div>
+        <div style={{ fontSize:11, color:C.text3, marginTop:2 }}>previsão para o próximo mês</div>
+      </div>
+    </div>
+
+    <div style={{ marginBottom: 14, display:'flex', gap:10, flexWrap:'wrap', alignItems:'center' }}>
+      <select value={filtroMes} onChange={function(e){ setFiltroMes(e.target.value) }} style={{ ...inputStyle, width:180 }}>
+        <option value="todos">📅 Todos os meses</option>
+        <option value="passado">Passados</option>
+        <option value="atual">Mês atual</option>
+        <option value="proximo">Próximo mês</option>
+        <option disabled>──────────</option>
+        {mesesUnicos.map(function(m){ return <option key={m} value={m}>{m}</option> })}
+      </select>
+      {podeVerTudo && (
+        <select value={filtroPessoa} onChange={function(e){ setFiltroPessoa(e.target.value) }} style={{ ...inputStyle, width:220 }}>
+          <option value="">Todos beneficiários</option>
+          {pessoas.map(function(p){ return <option key={p.id} value={p.id}>{p.nome}</option> })}
+        </select>
+      )}
+      <select value={filtroStatus} onChange={function(e){ setFiltroStatus(e.target.value) }} style={{ ...inputStyle, width:180 }}>
+        <option value="">Todos os status</option>
+        <option value="Prevista">Prevista</option>
+        <option value="Liberada">Liberada</option>
+        <option value="Atrasada">Atrasada</option>
+      </select>
+      {filtroMes !== 'todos' && (
+        <span style={{ fontSize:11, color:C.text3 }}>Exibindo {linhasFiltradas.length} de {linhas.length} parcelas</span>
+      )}
+    </div>
+
+    <div style={{ background: C.bgCard, border:'1px solid '+C.border, borderRadius:12, overflow:'hidden' }}>
+      {loading ? (
+        <div style={{ padding:24, color:C.text3, fontStyle:'italic' }}>Carregando...</div>
+      ) : linhasFiltradas.length === 0 ? (
+        <div style={{ padding:24, color:C.text3, fontStyle:'italic' }}>Nenhuma parcela {linhas.length > 0 ? 'no filtro selecionado' : 'de comissão'}.</div>
+      ) : (
+        <table style={{ width:'100%', borderCollapse:'collapse' }}>
+          <thead>
+            <tr style={{ background: C.bgHover }}>
+              {['Beneficiário','Papel','Cliente','Curso','Parcela','Vencimento','Cliente paga','%','Comissão','Status', podeVerTudo?'':null].filter(Boolean).map(function(h,i){
+                return <th key={i} style={{ textAlign:'left', padding:'12px 14px', fontSize:11, color:C.text3, fontWeight:600, textTransform:'uppercase', letterSpacing:'.05em' }}>{h}</th>
+              })}
+            </tr>
+          </thead>
+          <tbody>
+            {linhasFiltradas.map(function(l) {
+              var corStatus = l.comissao_parcela_status === 'Liberada' ? '#4ade80'
+                            : l.comissao_parcela_status === 'Atrasada' ? '#fca5a5'
+                            : C.gold
+              return (
+                <tr key={l.comissao_id+'_'+l.parcela_id} style={{ borderTop:'1px solid '+C.border }}>
+                  <td style={{ padding:'10px 14px', fontSize:13, color:C.text }}>{l.beneficiario_nome || '—'}</td>
+                  <td style={{ padding:'10px 14px' }}><Pill cor={coresPapel[l.papel]}>{l.papel}</Pill></td>
+                  <td style={{ padding:'10px 14px', fontSize:13, color:C.text2 }}>{l.cliente_nome || '—'}</td>
+                  <td style={{ padding:'10px 14px', fontSize:13, color:C.text2 }}>{l.curso_nome || '—'}</td>
+                  <td style={{ padding:'10px 14px', fontSize:13, color:C.text2 }}>#{l.parcela_numero}</td>
+                  <td style={{ padding:'10px 14px', fontSize:13, color:C.text2 }}>{fmtVenc(l.parcela_vencimento)}</td>
+                  <td style={{ padding:'10px 14px', fontSize:13, color:C.text2 }}>{fmt(l.parcela_valor_cliente)}</td>
+                  <td style={{ padding:'10px 14px', fontSize:12, color:C.text3 }}>{Number(l.percentual||0).toFixed(2)}%</td>
+                  <td style={{ padding:'10px 14px', fontSize:13, fontWeight:600, color:corStatus }}>{fmt(l.comissao_parcela_valor)}</td>
+                  <td style={{ padding:'10px 14px' }}><Pill cor={corStatus}>{l.comissao_parcela_status}</Pill></td>
+                  {podeVerTudo && (
+                    <td style={{ padding:'10px 14px', textAlign:'right', whiteSpace:'nowrap' }}>
+                      {l.parcela_status !== 'Pago' && (
+                        <button onClick={function(){ marcarParcelaPaga(l) }} style={btnPrimary}>Marcar pago</button>
+                      )}
+                    </td>
+                  )}
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  </>)
 }
 
 // ---------- ABA: Extrato ----------
@@ -138,12 +339,29 @@ function Extrato({ podeVerTudo, usuarioId }) {
   async function pagar(c) {
     var aPagar = Number(c.valor_a_pagar || 0)
     if (aPagar <= 0) return alert('Não há valor a pagar nesta comissão.')
-    var input = prompt('Valor a pagar agora (máx. ' + fmt(aPagar) + ')\nDeixe em branco para pagar o total.', aPagar.toFixed(2))
+
+    // Busca PIX e telefone do beneficiário
+    var benef = await supabase.from('profiles').select('nome, pix, telefone').eq('id', c.beneficiario_id).maybeSingle()
+    var pix = benef.data && benef.data.pix
+    var info = 'Beneficiário: ' + (c.beneficiario_nome || (benef.data && benef.data.nome) || '?') + '\n'
+    info += 'Disponível para pagar: ' + fmt(aPagar) + '\n'
+    if (pix) info += 'CHAVE PIX: ' + pix + '\n'
+    else info += '(sem PIX cadastrado — peça ao usuário cadastrar em Usuários)\n'
+    info += '\nValor a pagar agora (deixe em branco = total)\n'
+    info += '(máximo: ' + aPagar.toFixed(2) + ')'
+
+    var input = prompt(info, aPagar.toFixed(2))
     if (input === null) return
     var v = input.trim() === '' ? aPagar : Number(input.replace(',', '.'))
     if (isNaN(v) || v <= 0) return alert('Valor inválido.')
     if (v > aPagar + 0.01) return alert('Valor maior que o disponível.')
-    var obs = prompt('Observação (opcional):', '') || null
+
+    // Copia PIX pro clipboard se existir
+    if (pix && navigator.clipboard) {
+      try { await navigator.clipboard.writeText(pix) } catch(_e) {}
+    }
+
+    var obs = prompt('Observação (opcional):' + (pix ? '\n\nO PIX já foi copiado para sua área de transferência.' : ''), '') || null
 
     var { error } = await supabase.from('comissao_movimentos').insert({
       comissao_id: c.id, tipo: 'pagamento', valor: v, descricao: obs, criado_por: usuarioId
@@ -310,12 +528,27 @@ function Regras() {
     await carregar()
   }
 
+  async function aplicarEmTodas() {
+    if (!confirm('Aplicar TODAS as regras ativas em TODAS as vendas existentes?\n\nNão vai duplicar (pula vendas que já têm a comissão).\nLibera retroativo para parcelas já pagas.\n\nProsseguir?')) return
+    var { data, error } = await supabase.rpc('aplicar_regras_em_todas_vendas')
+    if (error) return alert('Erro: ' + error.message)
+    var msg = 'Regularização concluída:\n\n'
+      + '• Vendas processadas: ' + (data.vendas_processadas || 0) + '\n'
+      + '• Comissões criadas: ' + (data.comissoes_criadas || 0) + '\n'
+      + '• Já existentes (puladas): ' + (data.comissoes_existentes || 0)
+    if (data.vendas_sem_curso) msg += '\n• Vendas sem curso vinculado: ' + data.vendas_sem_curso + ' (precisam ser editadas)'
+    alert(msg)
+  }
+
   return (<>
-    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
-      <div style={{ fontSize: 13, color: C.text3 }}>
+    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16, gap:10, flexWrap:'wrap' }}>
+      <div style={{ fontSize: 13, color: C.text3, flex:'1 1 380px' }}>
         Cada regra responde: <strong style={{ color: C.text2 }}>quando vender este curso, quanto esta pessoa ganha?</strong> O percentual vigente no momento da venda é congelado na comissão — alterar a regra não afeta vendas passadas.
       </div>
-      <button onClick={function(){ setNovoAberto(true) }} style={btnPrimary}>+ Nova regra</button>
+      <div style={{ display:'flex', gap:8 }}>
+        <button onClick={aplicarEmTodas} style={{ ...btnGhost, padding:'8px 14px', fontSize:12 }} title="Aplica todas as regras ativas em todas as vendas existentes">🔄 Aplicar em todas</button>
+        <button onClick={function(){ setNovoAberto(true) }} style={btnPrimary}>+ Nova regra</button>
+      </div>
     </div>
 
     <div style={{ background: C.bgCard, border: '1px solid ' + C.border, borderRadius: 12, overflow: 'hidden' }}>

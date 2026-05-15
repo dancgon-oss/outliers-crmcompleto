@@ -60,7 +60,9 @@ export default function PipelinePage() {
   }
 
   async function fetchProfiles() {
-    var { data } = await supabase.from('profiles').select('id,nome,role').in('role', ['admin','comercial']).order('nome')
+    // Busca TODOS os profiles ativos pra exibir o nome do responsavel
+    // independente do role (mesmo operacional pode estar atribuido).
+    var { data } = await supabase.from('profiles').select('id,nome,role').order('nome')
     setProfiles(data || [])
   }
 
@@ -260,11 +262,15 @@ export default function PipelinePage() {
                   </select>
                 </div>
                 <div style={{ flex: 1, minWidth: 140 }}>
-                  <label style={{ display: 'block', fontSize: 10, color: C.text3, textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 5 }}>Responsável</label>
-                  <select style={{ ...S.inp, width: '100%' }} value={detalhe.responsavel_id || ''}
+                  <label style={{ display: 'block', fontSize: 10, color: C.text3, textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 5 }}>
+                    Responsável {!auth.isAdmin && <span style={{ color:C.text3 }}>(somente admin altera)</span>}
+                  </label>
+                  <select style={{ ...S.inp, width: '100%', opacity: auth.isAdmin ? 1 : 0.7, cursor: auth.isAdmin ? 'pointer' : 'not-allowed' }}
+                    value={detalhe.responsavel_id || ''}
+                    disabled={!auth.isAdmin}
                     onChange={async function(e){ await atribuirResponsavel(detalhe.id, e.target.value); setDetalhe(function(d){ return { ...d, responsavel_id: e.target.value || null } }) }}>
                     <option value="">Sem responsável</option>
-                    {profiles.map(function(p){ return <option key={p.id} value={p.id}>{p.nome}</option> })}
+                    {profiles.filter(function(p){ return p.role !== 'storydoing' && p.role !== 'aluno' }).map(function(p){ return <option key={p.id} value={p.id}>{p.nome}</option> })}
                   </select>
                 </div>
                 {detalhe.telefone && (
