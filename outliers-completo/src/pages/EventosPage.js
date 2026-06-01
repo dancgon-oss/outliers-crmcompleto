@@ -35,6 +35,7 @@ export default function EventosPage(props) {
   var [novoEvento, setNovoEvento] = useState({ nome: 'Paradigma', tipo: 'Paradigma', data_inicio: '', data_fim: '', local: '', descricao: '' })
   var [novoPart, setNovoPart] = useState({ nome: '', email: '', telefone: '', cpf: '' })
   var [search, setSearch] = useState('')
+  var [filtroAtivo, setFiltroAtivo] = useState(null) // null | 'presentes' | 'compraram'
 
   useEffect(function() { fetchEventos() }, [])
 
@@ -309,7 +310,11 @@ export default function EventosPage(props) {
   }
 
   var filtrados = participantes.filter(function(p) {
-    return p.nome.toLowerCase().includes(search.toLowerCase()) || (p.telefone||'').includes(search)
+    var matchBusca = p.nome.toLowerCase().includes(search.toLowerCase()) || (p.telefone||'').includes(search)
+    if (!matchBusca) return false
+    if (filtroAtivo === 'presentes') return !!p.checkin_at
+    if (filtroAtivo === 'compraram') return !!p.comprou
+    return true
   })
 
   var stats = {
@@ -387,19 +392,36 @@ export default function EventosPage(props) {
             </div>
           </div>
 
-          {/* Stats */}
+          {/* Stats (cards clicaveis funcionam como filtros) */}
           <div style={{ display: 'flex', borderBottom: '1px solid ' + C.border }}>
             {[
-              { label: 'Inscritos', value: stats.inscritos, icon: '👥' },
-              { label: 'Presentes', value: stats.presentes, icon: '✅', pct: stats.inscritos ? Math.round(stats.presentes/stats.inscritos*100) : 0 },
-              { label: 'Compraram', value: stats.compraram, icon: '💰', gold: true },
+              { label: 'Inscritos', value: stats.inscritos, icon: '👥', filter: null },
+              { label: 'Presentes', value: stats.presentes, icon: '✅', pct: stats.inscritos ? Math.round(stats.presentes/stats.inscritos*100) : 0, filter: 'presentes' },
+              { label: 'Compraram', value: stats.compraram, icon: '💰', gold: true, filter: 'compraram' },
               { label: 'Conversao', value: stats.inscritos ? Math.round(stats.compraram/stats.inscritos*100) + '%' : '0%', icon: '📈', gold: true },
             ].map(function(s, i) {
+              var clickable = s.filter !== undefined
+              var active = clickable && filtroAtivo === s.filter && (s.filter !== null || filtroAtivo === null)
+              // "Inscritos" (filter:null) so e' "ativo" visualmente quando nao ha filtro
+              var isInscritos = s.filter === null
+              var showActive = clickable && (isInscritos ? filtroAtivo === null : filtroAtivo === s.filter)
               return (
-                <div key={i} style={{ flex: 1, padding: '14px 18px', borderRight: i < 3 ? '1px solid ' + C.border : 'none', textAlign: 'center' }}>
+                <div key={i}
+                  onClick={clickable ? function(){ setFiltroAtivo(isInscritos ? null : (filtroAtivo === s.filter ? null : s.filter)) } : undefined}
+                  title={clickable ? (isInscritos ? 'Mostrar todos' : (showActive ? 'Clique para limpar o filtro' : 'Filtrar por ' + s.label.toLowerCase())) : undefined}
+                  style={{
+                    flex: 1, padding: '14px 18px',
+                    borderRight: i < 3 ? '1px solid ' + C.border : 'none',
+                    textAlign: 'center',
+                    cursor: clickable ? 'pointer' : 'default',
+                    background: showActive ? C.bgHover : 'transparent',
+                    borderTop: showActive ? '2px solid ' + C.gold : '2px solid transparent',
+                    transition: 'background .15s, border-color .15s',
+                    userSelect: 'none',
+                  }}>
                   <div style={{ fontSize: 20, marginBottom: 4 }}>{s.icon}</div>
-                  <div style={{ fontSize: 22, fontWeight: 700, color: s.gold ? C.gold : C.text }}>{s.value}</div>
-                  <div style={{ fontSize: 10, color: C.text3, textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: 2 }}>{s.label}</div>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: s.gold ? C.gold : (showActive ? C.gold : C.text) }}>{s.value}</div>
+                  <div style={{ fontSize: 10, color: showActive ? C.gold : C.text3, textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: 2, fontWeight: showActive ? 700 : 600 }}>{s.label}</div>
                   {s.pct !== undefined && <div style={{ fontSize: 10, color: C.text3, marginTop: 1 }}>{s.pct}%</div>}
                 </div>
               )
