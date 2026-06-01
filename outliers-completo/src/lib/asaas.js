@@ -50,6 +50,35 @@ export async function criarCobranca(opts) {
   return await asaasRequest('POST', '/payments', payload)
 }
 
+// Cria UM parcelamento (installment) no Asaas que gera N cobrancas vinculadas
+// como uma unica venda parcelada (em vez de N cobrancas avulsas).
+// Use `installmentValue` quando todas parcelas tem o MESMO valor exato;
+// use `totalValue` quando ha pequena variacao de centavos (Asaas redistribui).
+// A resposta contem o ID do primeiro pagamento + o campo `installment` (ID pai).
+export async function criarCobrancaParcelada(opts) {
+  var payload = {
+    customer: opts.asaasCustomerId,
+    billingType: opts.billingType || 'UNDEFINED',
+    dueDate: opts.vencimento,
+    installmentCount: opts.installmentCount,
+    description: opts.descricao || 'Outliers - Programa',
+    externalReference: opts.externalReference || '',
+  }
+  if (opts.installmentValue != null) payload.installmentValue = opts.installmentValue
+  else if (opts.totalValue != null) payload.totalValue = opts.totalValue
+  else throw new Error('criarCobrancaParcelada: informe installmentValue ou totalValue')
+  return await asaasRequest('POST', '/payments', payload)
+}
+
+// Lista as N cobrancas que pertencem a um installment (parcelamento) do Asaas.
+// Retorna array de payments ordenado por data de vencimento.
+export async function listarPagamentosInstallment(installmentId) {
+  var res = await asaasRequest('GET', '/payments?installment=' + encodeURIComponent(installmentId) + '&limit=100')
+  var lista = (res && res.data) ? res.data : []
+  lista.sort(function(a, b){ return (a.dueDate || '').localeCompare(b.dueDate || '') })
+  return lista
+}
+
 export async function buscarPixQrCode(paymentId) {
   return await asaasRequest('GET', '/payments/' + paymentId + '/pixQrCode')
 }

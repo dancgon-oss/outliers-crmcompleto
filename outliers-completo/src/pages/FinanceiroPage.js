@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { fmt, fmtDate, formatTel, diasAteVencer, C, PARC_C, ASAAS_STATUS_PT } from '../lib/ui'
-import { syncClienteAsaas, criarCobranca, buscarPixQrCode, gerarLinkWhatsApp } from '../lib/asaas'
+import { syncClienteAsaas, criarCobranca, criarCobrancaParcelada, listarPagamentosInstallment, buscarPixQrCode, gerarLinkWhatsApp } from '../lib/asaas'
 
 function Icon({ d, size }) {
   return (
@@ -548,7 +548,12 @@ export default function FinanceiroPage() {
   }
 
   // Emite cobranças no Asaas pra TODAS as parcelas pendentes que ainda não têm
-  // asaas_payment_id. Usa o `cobrancaBilling` atual. Serial pra respeitar rate limit Asaas.
+  // asaas_payment_id. Usa o `cobrancaBilling` atual.
+  //
+  // Quando ha 2+ parcelas pendentes, agrupa como UM parcelamento (installment)
+  // do Asaas — uma unica venda parcelada com N cobrancas vinculadas, em vez
+  // de N cobrancas avulsas. Se o agrupamento falhar (ou for so 1 parcela),
+  // cai automaticamente no modo individual (preserva fluxo antigo).
   async function emitirEmMassa() {
     if (!selected || !financeiro) return
     var pendentes = (financeiro.parcelas || []).filter(function(p) {
@@ -558,11 +563,10 @@ export default function FinanceiroPage() {
     pendentes.sort(function(a, b){ return (a.numero || 0) - (b.numero || 0) })
 
     var labelBilling = cobrancaBilling === 'UNDEFINED' ? 'Cliente escolhe' : cobrancaBilling
-    var confirmar = window.confirm(
-      'Emitir ' + pendentes.length + ' cobrança(s) no Asaas como ' + labelBilling + '?'
-      + '\n\nO cliente será sincronizado no Asaas se ainda não estiver.'
-    )
-    if (!confirmar) return
+    var msgConfirm = pendentes.length >= 2
+      ? 'Emitir parcelamento de ' + pendentes.length + 'x no Asaas como ' + labelBilling + '?\n\nVai criar UMA venda parcelada com as cobrancas vinculadas, em vez de cobrancas avulsas.'
+      : 'Emitir cobranca no Asaas como ' + labelBilling + '?'
+    if (!window.confirm(msgConfirm + '\n\nO cliente sera sincronizado no Asaas se ainda nao estiver.')) return
 
     setMassLoading(true)
     setMassProgress({ atual: 0, total: pendentes.length, ok: 0, err: 0, msg: 'Sincronizando cliente...' })
@@ -574,39 +578,21 @@ export default function FinanceiroPage() {
         await supabase.from('clientes').update({ asaas_customer_id: asaasId }).eq('id', selected.id)
       }
 
-      var ok = 0, err = 0
-      for (var i = 0; i < pendentes.length; i++) {
-        var p = pendentes[i]
-        setMassProgress({ atual: i + 1, total: pendentes.length, ok: ok, err: err, msg: 'Emitindo parcela ' + p.numero + '/' + pendentes.length })
+      // Tenta caminho agrupado (installment) quando ha 2+ parcelas
+      var usouAgrupado = false
+      if (pendentes.length >= 2) {
         try {
-          var cob = await criarCobranca({
-            asaasCustomerId: asaasId,
-            valor: p.valor,
-            vencimento: p.vencimento || new Date().toISOString().split('T')[0],
-            descricao: 'Outliers · Parcela ' + p.numero,
-            billingType: cobrancaBilling,
-            parcelaId: p.id,
-          })
-          var pix = null
-          if ((cobrancaBilling === 'PIX' || cobrancaBilling === 'UNDEFINED') && cob.id) {
-            try { pix = await buscarPixQrCode(cob.id) } catch (_e) {}
-          }
-          await supabase.from('parcelas').update({
-            asaas_payment_id: cob.id,
-            asaas_status: cob.status,
-            asaas_invoice_url: cob.invoiceUrl,
-            asaas_boleto_url: cob.bankSlipUrl,
-            asaas_pix_copia_cola: pix ? pix.payload : null,
-            forma_pagamento: mapForma(cobrancaBilling),
-          }).eq('id', p.id)
-          ok++
-        } catch (e) {
-          console.error('emitir parcela', p.numero, e)
-          err++
+          await emitirAgrupado(asaasId, pendentes)
+          usouAgrupado = true
+        } catch (eAgr) {
+          console.warn('Falha ao emitir parcelamento agrupado, fallback individual:', eAgr)
+          setMassProgress({ atual: 0, total: pendentes.length, ok: 0, err: 0, msg: 'Parcelamento agrupado falhou, emitindo individual...' })
         }
       }
 
-      setMassProgress({ atual: pendentes.length, total: pendentes.length, ok: ok, err: err, msg: 'Concluído' })
+      if (!usouAgrupado) {
+        await emitirIndividual(asaasId, pendentes)
+      }
 
       // Atualiza dados
       var { data: fin } = await supabase.from('financeiro').select('*, parcelas(*)').eq('cliente_id', selected.id).maybeSingle()
@@ -618,6 +604,101 @@ export default function FinanceiroPage() {
     setMassLoading(false)
 
     setTimeout(function(){ setMassProgress(null) }, 5000)
+  }
+
+  // Caminho A: cria UM parcelamento no Asaas com installmentCount=N
+  // Vincula cada parcela do banco a um dos N pagamentos retornados (em ordem
+  // de vencimento). Throw em caso de falha — o caller cai no fallback individual.
+  async function emitirAgrupado(asaasId, pendentes) {
+    setMassProgress({ atual: 0, total: pendentes.length, ok: 0, err: 0, msg: 'Criando parcelamento (' + pendentes.length + 'x) no Asaas...' })
+
+    var soma = pendentes.reduce(function(s, p){ return s + Number(p.valor || 0) }, 0)
+    soma = Math.round(soma * 100) / 100
+
+    // Heuristica: se TODAS parcelas tem exatamente o mesmo valor usa installmentValue
+    // (encaixe perfeito). Caso contrario usa totalValue (Asaas redistribui centavos).
+    var primeiro = Number(pendentes[0].valor || 0)
+    var todasIguais = pendentes.every(function(p){ return Math.round(Number(p.valor||0) * 100) === Math.round(primeiro * 100) })
+
+    var optsParc = {
+      asaasCustomerId: asaasId,
+      billingType: cobrancaBilling,
+      installmentCount: pendentes.length,
+      vencimento: pendentes[0].vencimento || new Date().toISOString().split('T')[0],
+      descricao: 'Outliers - Programa (' + pendentes.length + 'x)',
+      externalReference: financeiro && financeiro.id ? String(financeiro.id) : '',
+    }
+    if (todasIguais) optsParc.installmentValue = primeiro
+    else optsParc.totalValue = soma
+
+    var parc = await criarCobrancaParcelada(optsParc)
+    var installmentId = parc.installment || parc.id
+    if (!installmentId) throw new Error('Asaas nao retornou installment id')
+
+    setMassProgress({ atual: 0, total: pendentes.length, ok: 0, err: 0, msg: 'Buscando cobrancas geradas...' })
+    var pagamentos = await listarPagamentosInstallment(installmentId)
+    if (pagamentos.length !== pendentes.length) {
+      throw new Error('Asaas retornou ' + pagamentos.length + ' pagamentos, esperava ' + pendentes.length)
+    }
+
+    // Vincula cada parcela do banco ao pagamento correspondente (ordem por vencimento)
+    var ok = 0
+    for (var i = 0; i < pendentes.length; i++) {
+      var p = pendentes[i]
+      var cob = pagamentos[i]
+      var pix = null
+      if ((cobrancaBilling === 'PIX' || cobrancaBilling === 'UNDEFINED') && cob.id) {
+        try { pix = await buscarPixQrCode(cob.id) } catch (_e) {}
+      }
+      await supabase.from('parcelas').update({
+        asaas_payment_id: cob.id,
+        asaas_installment_id: installmentId,
+        asaas_status: cob.status,
+        asaas_invoice_url: cob.invoiceUrl,
+        asaas_boleto_url: cob.bankSlipUrl,
+        asaas_pix_copia_cola: pix ? pix.payload : null,
+        forma_pagamento: mapForma(cobrancaBilling),
+      }).eq('id', p.id)
+      ok++
+      setMassProgress({ atual: i + 1, total: pendentes.length, ok: ok, err: 0, msg: 'Vinculando parcela ' + (i + 1) + '/' + pendentes.length })
+    }
+    setMassProgress({ atual: pendentes.length, total: pendentes.length, ok: ok, err: 0, msg: 'Concluido (parcelamento unico)' })
+  }
+
+  // Caminho B (fallback): cria N cobrancas avulsas no Asaas, uma por parcela.
+  async function emitirIndividual(asaasId, pendentes) {
+    var ok = 0, err = 0
+    for (var i = 0; i < pendentes.length; i++) {
+      var p = pendentes[i]
+      setMassProgress({ atual: i + 1, total: pendentes.length, ok: ok, err: err, msg: 'Emitindo parcela ' + p.numero + '/' + pendentes.length })
+      try {
+        var cob = await criarCobranca({
+          asaasCustomerId: asaasId,
+          valor: p.valor,
+          vencimento: p.vencimento || new Date().toISOString().split('T')[0],
+          descricao: 'Outliers · Parcela ' + p.numero,
+          billingType: cobrancaBilling,
+          parcelaId: p.id,
+        })
+        var pix = null
+        if ((cobrancaBilling === 'PIX' || cobrancaBilling === 'UNDEFINED') && cob.id) {
+          try { pix = await buscarPixQrCode(cob.id) } catch (_e) {}
+        }
+        await supabase.from('parcelas').update({
+          asaas_payment_id: cob.id,
+          asaas_status: cob.status,
+          asaas_invoice_url: cob.invoiceUrl,
+          asaas_boleto_url: cob.bankSlipUrl,
+          asaas_pix_copia_cola: pix ? pix.payload : null,
+          forma_pagamento: mapForma(cobrancaBilling),
+        }).eq('id', p.id)
+        ok++
+      } catch (e) {
+        console.error('emitir parcela', p.numero, e)
+        err++
+      }
+    }
+    setMassProgress({ atual: pendentes.length, total: pendentes.length, ok: ok, err: err, msg: 'Concluido (individual)' })
   }
 
   var filtrados = clientes.filter(function(c) {
